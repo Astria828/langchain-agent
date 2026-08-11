@@ -1,0 +1,352 @@
+import { useEffect, useState } from 'react';
+
+import PageHeader from '@/components/PageHeader';
+import { useAppStore } from '@/stores/appStore';
+import type { ModelEndpointConfig, ModelGroup } from '@/types';
+
+/**
+ * 主 API、Embedding API 与索引重建（设计稿第 7110–7154 行）。
+ *
+ * 关键规则（PRD §3.6）：
+ * - 只有连接测试通过的配置才允许保存生效。
+ * - API Key 不明文回显，前端只显示「已配置」状态与脱敏尾号。
+ * - Embedding 模型或向量维度变更后必须重建索引，重建完成前不混用新旧向量。
+ */
+
+interface GroupDef {
+  id: ModelGroup;
+  icon: string;
+  title: string;
+  desc: string;
+}
+
+const GROUPS: GroupDef[] = [
+  { id: 'main', icon: '✎', title: '主 API', desc: '对话生成、世界书拆分、记忆提取与整合' },
+  {
+    id: 'embed',
+    icon: '⌕',
+    title: 'Embedding 模型',
+    desc: '世界书条目与长期记忆的向量化，供 RAG 语义检索',
+  },
+];
+
+interface Draft {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+}
+
+type BusyAction = `${ModelGroup}:test` | `${ModelGroup}:save` | 'embed:rebuild';
+
+export default function ApiSettingsPage() {
+  const modelSettings = useAppStore((s) => s.modelSettings);
+  const modelSettingsLoading = useAppStore((s) => s.modelSettingsLoading);
+  const modelSettingsError = useAppStore((s) => s.modelSettingsError);
+  const rebuildRequired = useAppStore((s) => s.rebuildRequired);
+  const loadModelSettings = useAppStore((s) => s.loadModelSettings);
+  const testModel = useAppStore((s) => s.testModel);
+  const saveModel = useAppStore((s) => s.saveModel);
+  const rebuildIndex = useAppStore((s) => s.rebuildIndex);
+
+  const [drafts, setDrafts] = useState<Record<ModelGroup, Draft> | null>(null);
+  const [tested, setTested] = useState<Record<ModelGroup, boolean>>({ main: false, embed: false });
+  const [busyAction, setBusyAction] = useState<BusyAction | null>(null);
+
+  // 从服务端的脱敏配置初始化草稿；apiKey 始终留空，永不回显已保存的密钥
+  useEffect(() => {
+    if (!modelSettings || drafts) return;
+    setDrafts({
+      main: { baseUrl: modelSettings.main.baseUrl, model: modelSettings.main.model, apiKey: '' },
+      embed: { baseUrl: modelSettings.embed.baseUrl, model: modelSettings.embed.model, apiKey: '' },
+    });
+  }, [modelSettings, drafts]);
+
+  if (!modelSettings || !drafts) {
+    return (
+      <div style={{ height: '100%', overflowY: 'auto', padding: '52px 56px' }}>
+        <div style={{ maxWidth: 640, margin: '0 auto' }}>
+          <PageHeader
+            title="API 配置"
+            subtitle="主 API 负责对话生成等常规功能；Embedding 模型用于世界书与记忆的向量检索。"
+          />
+          <div className="card" style={{ marginTop: 34, padding: '26px 28px', borderRadius: 16 }}>
+            <div className={modelSettingsError ? 'note-warn' : 'note-ok'}>
+              {modelSettingsLoading
+                ? '正在读取后端模型配置…'
+                : modelSettingsError ?? '正在准备模型配置…'}
+            </div>
+            {modelSettingsError && (
+              <button
+                className="btn-ghost"
+                onClick={() => void loadModelSettings()}
+                disabled={modelSettingsLoading}
+                style={{ marginTop: 16, fontSize: 12.5, padding: '9px 18px' }}
+              >
+                {modelSettingsLoading ? '正在重试…' : '重新连接后端'}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const patch = (group: ModelGroup, field: keyof Draft, value: string) => {
+    setDrafts((prev) => (prev ? { ...prev, [group]: { ...prev[group], [field]: value } } : prev));
+    // 任何字段改动都会作废上一次的连接测试结果
+    setTested((prev) => ({ ...prev, [group]: false }));
+  };
+
+  const handleTest = async (group: ModelGroup) => {
+    setBusyAction(`${group}:test`);
+    try {
+      const ok = await testModel(group, drafts[group]);
+      setTested((prev) => ({ ...prev, [group]: ok }));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleSave = async (group: ModelGroup) => {
+    setBusyAction(`${group}:save`);
+    try {
+      const saved = await saveModel(group, drafts[group]);
+      if (!saved) return;
+      setDrafts((prev) =>
+        prev
+          ? {
+              ...prev,
+              [group]: { baseUrl: saved.baseUrl, model: saved.model, apiKey: '' },
+            }
+          : prev,
+      );
+      setTested((prev) => ({ ...prev, [group]: false }));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleRebuild = async () => {
+    setBusyAction('embed:rebuild');
+    try {
+      await rebuildIndex();
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  return (
+    <div style={{ height: '100%', overflowY: 'auto', padding: '52px 56px' }}>
+      <div style={{ maxWidth: 640, margin: '0 auto' }}>
+        <PageHeader
+          title="API 配置"
+          subtitle="主 API 负责对话生成等常规功能；Embedding 模型用于世界书与记忆的向量检索。"
+        />
+
+        {GROUPS.map((g) => (
+          <GroupCard
+            key={g.id}
+            def={g}
+            saved={modelSettings[g.id]}
+            draft={drafts[g.id]}
+            tested={tested[g.id]}
+            showRebuild={g.id === 'embed' && rebuildRequired}
+            onField={(field, value) => patch(g.id, field, value)}
+            testing={busyAction === `${g.id}:test`}
+            saving={busyAction === `${g.id}:save`}
+            rebuilding={busyAction === 'embed:rebuild'}
+            actionLocked={busyAction !== null}
+            onTest={() => void handleTest(g.id)}
+            onSave={() => void handleSave(g.id)}
+            onRebuild={() => void handleRebuild()}
+          />
+        ))}
+
+        <div className="note-ok" style={{ marginTop: 26 }}>
+          ✦ API Key 加密保存在本地，不会明文回传或写入日志 · 仅连接测试通过后可保存生效
+        </div>
+        <div style={{ height: 40 }} />
+      </div>
+    </div>
+  );
+}
+
+interface CardProps {
+  def: GroupDef;
+  saved: ModelEndpointConfig;
+  draft: Draft;
+  tested: boolean;
+  showRebuild: boolean;
+  testing: boolean;
+  saving: boolean;
+  rebuilding: boolean;
+  actionLocked: boolean;
+  onField: (field: keyof Draft, value: string) => void;
+  onTest: () => void;
+  onSave: () => void;
+  onRebuild: () => void;
+}
+
+function GroupCard({
+  def,
+  saved,
+  draft,
+  tested,
+  showRebuild,
+  testing,
+  saving,
+  rebuilding,
+  actionLocked,
+  onField,
+  onTest,
+  onSave,
+  onRebuild,
+}: CardProps) {
+  const newKey = draft.apiKey.trim();
+  const dirty =
+    saved.baseUrl !== draft.baseUrl || saved.model !== draft.model || !!newKey || !saved.keySet;
+  const status = dirty ? (tested ? '测试通过 · 待保存' : '未验证') : '已生效';
+  const green = status !== '未验证';
+  const canSave = dirty && tested;
+
+  const fields: Array<{
+    key: keyof Draft;
+    label: string;
+    type: string;
+    placeholder: string;
+    masked: boolean;
+  }> = [
+    { key: 'baseUrl', label: 'BASE URL', type: 'text', placeholder: 'https://…', masked: false },
+    {
+      key: 'apiKey',
+      label: 'API KEY',
+      type: 'password',
+      placeholder: saved.keySet ? '已加密保存 · 留空表示不修改' : 'sk-…',
+      masked: saved.keySet,
+    },
+    { key: 'model', label: '模型名称', type: 'text', placeholder: '模型 ID', masked: false },
+  ];
+
+  return (
+    <div
+      className="card"
+      style={{ marginTop: 34, padding: '26px 28px', borderRadius: 16 }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ fontSize: 17 }}>{def.icon}</span>
+        <span className="serif" style={{ fontSize: 16.5, fontWeight: 600 }}>
+          {def.title}
+        </span>
+        <span
+          style={{
+            fontSize: 11,
+            color: green ? 'var(--ok)' : 'var(--warn)',
+            padding: '3px 11px',
+            borderRadius: 12,
+            background: green ? 'rgba(143,214,160,.08)' : 'rgba(224,185,106,.08)',
+            border: `1px solid ${green ? 'rgba(143,214,160,.2)' : 'rgba(224,185,106,.25)'}`,
+          }}
+        >
+          ● {status}
+        </span>
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--text-dim-2)', marginTop: 7, lineHeight: 1.6 }}>
+        {def.desc}
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 18, marginTop: 22 }}>
+        {fields.map((f) => (
+          <div key={f.key}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <span className="label-section">{f.label}</span>
+              {f.masked && (
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: 'var(--ok)',
+                    padding: '2px 9px',
+                    borderRadius: 10,
+                    background: 'rgba(143,214,160,.08)',
+                    border: '1px solid rgba(143,214,160,.2)',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  已配置 · ••••{saved.keyTail}
+                </span>
+              )}
+            </div>
+            <input
+              className="input input--deep"
+              type={f.type}
+              value={draft[f.key]}
+              onChange={(e) => onField(f.key, e.target.value)}
+              placeholder={f.placeholder}
+              style={{ padding: '12px 16px', lineHeight: 'normal' }}
+            />
+          </div>
+        ))}
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          flexWrap: 'wrap',
+          marginTop: 20,
+        }}
+      >
+        <button
+          className="btn-ghost"
+          onClick={onTest}
+          disabled={actionLocked}
+          style={{ fontSize: 12.5, padding: '9px 18px' }}
+        >
+          {testing ? '正在测试…' : '测试连接'}
+        </button>
+        <button
+          className="btn-primary"
+          onClick={onSave}
+          disabled={!canSave || actionLocked}
+          style={{ fontSize: 12.5, padding: '9px 20px' }}
+        >
+          {saving ? '正在保存…' : '保存并生效'}
+        </button>
+        <span style={{ fontSize: 11.5, color: 'var(--text-dim-3)', lineHeight: 1.6 }}>
+          {!dirty ? '当前配置已生效' : tested ? '连接测试已通过，可保存生效' : '需先通过连接测试才能保存'}
+        </span>
+      </div>
+
+      {showRebuild && (
+        <div className="note-warn" style={{ marginTop: 16 }}>
+          <div style={{ fontSize: 12.5, color: 'var(--warn)', lineHeight: 1.7, fontWeight: 600 }}>
+            ⚠ Embedding 模型或向量维度已变更
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--accent-pale)', lineHeight: 1.7, marginTop: 6 }}>
+            必须重建世界书与长期记忆索引，重建完成前不会使用旧向量检索。
+          </div>
+          <button
+            onClick={onRebuild}
+            disabled={actionLocked}
+            style={{
+              marginTop: 12,
+              fontSize: 12.5,
+              fontWeight: 600,
+              color: 'var(--on-accent)',
+              background: 'linear-gradient(135deg,#e0b96a,#e2704e)',
+              border: 'none',
+              padding: '9px 18px',
+              borderRadius: 20,
+              cursor: actionLocked ? 'not-allowed' : 'pointer',
+              opacity: actionLocked ? 0.65 : 1,
+              fontFamily: 'inherit',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {rebuilding ? '正在重建索引…' : '立即重建索引'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

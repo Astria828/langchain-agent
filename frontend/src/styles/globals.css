@@ -1,0 +1,687 @@
+/* ============================================================
+   织境 LoreWeave · 全局主题
+   调色板与基础规则逐值复刻自交互设计稿（doc/ui-reference.html）。
+   设计稿中的 style-hover / style-focus 是原型私有属性，浏览器不认，
+   这里统一转为真实的 :hover / :focus CSS 规则。
+   ============================================================ */
+
+:root {
+  /* 底色与容器 */
+  --bg: #161009;
+  --surface: #211710;
+  --surface-deep: #1a120b;
+  --surface-deepest: #140d07;
+
+  /* 文字（由亮到暗） */
+  --text: #f5ebdd;
+  --text-strong: #f0e4d2;
+  --text-body: #e8dbc8;
+  --text-soft: #cbb9a2;
+  --text-quiet: #bda990;
+  --text-mute: #a5937f;
+  --text-dim: #9a8875;
+  --text-dim-2: #8a7867;
+  --text-dim-3: #7d6d5f;
+  --text-dim-4: #6e5f51;
+
+  /* 琥珀主色 */
+  --accent: #f0a35e;
+  --accent-2: #e2704e;
+  --accent-deep: #c9964f;
+  --accent-soft: #d9b98f;
+  --accent-bright: #f7cf9e;
+  --accent-pale: #c9ad86;
+  --on-accent: #2a1408;
+  --grad-accent: linear-gradient(135deg, #f0a35e, #e2704e);
+
+  /* 描边 */
+  --line: rgba(255, 214, 170, 0.09);
+  --line-2: rgba(255, 214, 170, 0.1);
+  --line-3: rgba(255, 214, 170, 0.12);
+  --line-4: rgba(255, 214, 170, 0.14);
+  --line-accent: rgba(240, 163, 94, 0.25);
+  --line-accent-on: rgba(240, 163, 94, 0.45);
+
+  /* 语义色 */
+  --ok: #8fbf9a;
+  --ok-bright: #a8d9b3;
+  --warn: #e0b96a;
+  --err: #e2917a;
+  --danger: #d99383;
+  --danger-text: #c98a7a;
+
+  /* 日志级别 */
+  --lv-debug: #9db8d9;
+  --lv-info: #8fbf9a;
+  --lv-warning: #e0b96a;
+  --lv-error: #e2917a;
+
+  /* 角色/用户名标签 */
+  --speaker-char: #c9964f;
+  --speaker-user: #9a8471;
+
+  --font-sans: 'Noto Sans SC', sans-serif;
+  --font-serif: 'Noto Serif SC', serif;
+  --font-mono: 'SF Mono', Consolas, monospace;
+}
+
+/* ── reset / 基础（设计稿 6510–6520 行） ─────────────────── */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  color: #f7bd85;
+}
+
+::placeholder {
+  color: #7a6a5c;
+}
+
+textarea,
+input,
+select,
+button {
+  outline: none;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* 竖向分栏拖动条：视觉保持细线，交互热区扩展到 8px。 */
+.resize-divider {
+  position: relative;
+  z-index: 5;
+  width: 8px;
+  height: 100%;
+  flex: none;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.resize-divider::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--line);
+  transition: width 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+
+.resize-divider:hover::before,
+.resize-divider:focus-visible::before,
+.resize-divider[data-dragging='true']::before {
+  width: 2px;
+  background: var(--line-accent-on);
+  box-shadow: 0 0 10px rgba(240, 163, 94, 0.28);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #3a2d22;
+  border-radius: 6px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes glowPulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+@keyframes toastIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 12px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@keyframes caretBlink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.15;
+  }
+}
+
+/* ── 按钮 ─────────────────────────────────────────────── */
+
+/* 琥珀渐变主按钮 */
+.btn-primary {
+  border: none;
+  background: var(--grad-accent);
+  color: var(--on-accent);
+  font-weight: 600;
+  font-family: inherit;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: box-shadow 0.15s;
+}
+.btn-primary:hover:not(:disabled) {
+  box-shadow: 0 0 22px rgba(240, 163, 94, 0.45);
+}
+.btn-primary:disabled {
+  color: var(--text-dim-4);
+  background: transparent;
+  border: 1px solid var(--line-3);
+}
+
+/* 描边胶囊按钮 */
+.btn-ghost {
+  color: var(--accent-soft);
+  background: transparent;
+  border: 1px solid var(--line-accent);
+  border-radius: 20px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.btn-ghost:hover {
+  background: rgba(240, 163, 94, 0.08);
+}
+
+/* 中性描边按钮，hover 转琥珀 */
+.btn-dim {
+  color: var(--text-dim-2);
+  background: transparent;
+  border: 1px solid var(--line-3);
+  border-radius: 20px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+}
+.btn-dim:hover {
+  color: var(--accent-soft);
+  border-color: var(--line-accent);
+}
+
+/* 中性描边按钮，hover 转危险色 */
+.btn-dim-danger {
+  color: var(--text-dim-2);
+  background: transparent;
+  border: 1px solid var(--line-4);
+  border-radius: 20px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+}
+.btn-dim-danger:hover {
+  color: var(--danger-text);
+  border-color: rgba(226, 112, 78, 0.35);
+}
+
+/* 描边危险按钮（角色卡「删除」） */
+.btn-outline-danger {
+  color: var(--danger-text);
+  background: transparent;
+  border: 1px solid rgba(226, 112, 78, 0.3);
+  border-radius: 20px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s;
+}
+.btn-outline-danger:hover {
+  background: rgba(226, 112, 78, 0.1);
+}
+
+/* 实心危险按钮（删除确认框里的「删除」） */
+.btn-danger {
+  font-weight: 600;
+  color: var(--on-accent);
+  background: var(--danger);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/* 删除确认框里的「取消」 */
+.btn-cancel {
+  color: #b3a091;
+  background: transparent;
+  border: 1px solid rgba(255, 214, 170, 0.16);
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/* 方形图标按钮（垃圾桶等） */
+.icon-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim-2);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+.icon-btn:hover {
+  background: rgba(217, 147, 131, 0.14);
+  color: var(--danger);
+}
+
+/* 世界书里更暗一档的图标按钮 */
+.icon-btn-soft {
+  border: none;
+  background: transparent;
+  color: var(--text-dim-4);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+.icon-btn-soft:hover {
+  color: var(--danger-text);
+  background: rgba(226, 112, 78, 0.1);
+}
+
+/* 无边框图标（列表折叠钮） */
+.icon-plain {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--speaker-user);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: color 0.15s;
+}
+.icon-plain:hover {
+  color: var(--accent);
+}
+
+/* 小号 ✕ */
+.x-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim-4);
+  cursor: pointer;
+  font-family: inherit;
+  transition: color 0.15s;
+}
+.x-btn:hover {
+  color: var(--danger-text);
+}
+
+/* 侧边栏导航项 */
+.nav-btn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: 11px;
+  font-size: 14px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s;
+}
+.nav-btn:hover {
+  background: rgba(240, 163, 94, 0.09);
+}
+
+/* ── 筛选胶囊 ─────────────────────────────────────────── */
+
+.chip {
+  border-radius: 20px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  border: 1px solid var(--line-4);
+  background: transparent;
+  color: var(--text-dim);
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.chip:hover {
+  border-color: var(--line-accent);
+}
+/* 尺寸更小的一档（记忆类型 / 日志级别与时间）。
+   必须放在 .chip--on 之前：两者特异度相同，后者要能覆盖这里的描边与文字色。 */
+.chip--sm {
+  border-radius: 18px;
+  border-color: var(--line-3);
+  color: var(--text-dim-2);
+}
+
+.chip--on {
+  border-color: var(--line-accent-on);
+  background: rgba(240, 163, 94, 0.12);
+  color: var(--accent-bright);
+}
+
+/* ── 卡片 ─────────────────────────────────────────────── */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+}
+
+/* 可点选卡片（新会话页角色/世界书） */
+.card-pick {
+  background: var(--surface);
+  border-radius: 16px;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.card-pick:hover {
+  border-color: rgba(240, 163, 94, 0.5);
+}
+
+/* 侧栏列表卡片（角色卡 / 世界书） */
+.card-list {
+  border-radius: 14px;
+  transition: border-color 0.15s;
+}
+.card-list:hover {
+  border-color: rgba(240, 163, 94, 0.4);
+}
+
+/* ── 表单控件 ─────────────────────────────────────────── */
+
+.input,
+.textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  padding: 13px 16px;
+  color: var(--text-body);
+  font-size: 13.5px;
+  line-height: 1.8;
+  font-family: var(--font-sans);
+  transition: border-color 0.15s;
+}
+.textarea {
+  resize: vertical;
+}
+.input:focus,
+.textarea:focus {
+  border-color: var(--line-accent-on);
+}
+
+/* 更深底色的一档（API 配置 / 世界书原文 / 条目内容） */
+.input--deep,
+.textarea--deep {
+  background: var(--surface-deep);
+}
+.textarea--soft:focus {
+  border-color: rgba(240, 163, 94, 0.4);
+}
+
+/* 下划线式标题输入 */
+.input-underline {
+  width: 100%;
+  box-sizing: border-box;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--line-3);
+  color: var(--text);
+  font-family: var(--font-serif);
+  font-weight: 600;
+  transition: border-bottom-color 0.15s;
+}
+.input-underline:focus {
+  border-bottom-color: var(--line-accent-on);
+}
+
+/* 下划线式普通输入（关键词行） */
+.input-underline-soft {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--line-2);
+  color: var(--text-mute);
+  font-family: inherit;
+  transition: border-bottom-color 0.15s;
+}
+.input-underline-soft:focus {
+  border-bottom-color: rgba(240, 163, 94, 0.4);
+}
+
+/* 无边框输入（角色 tagline） */
+.input-bare {
+  width: 100%;
+  box-sizing: border-box;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-family: inherit;
+}
+
+/* 无边框 textarea（对话示例 / 草稿正文） */
+.textarea-bare {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  background: transparent;
+  border: none;
+  color: var(--text-body);
+  font-family: var(--font-sans);
+}
+
+/* 对话标题输入 */
+.title-input {
+  width: 100%;
+  box-sizing: border-box;
+  max-width: 320px;
+  text-overflow: ellipsis;
+  font-size: 16.5px;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 2px 6px;
+  margin-left: -6px;
+  font-family: inherit;
+  transition: border-color 0.15s, background 0.15s;
+}
+.title-input:hover:not(:disabled) {
+  border-color: rgba(255, 214, 170, 0.16);
+}
+.title-input:focus:not(:disabled) {
+  border-color: var(--line-accent-on);
+  background: rgba(20, 14, 10, 0.5);
+}
+
+/* 条目分类小输入 */
+.input-tag {
+  box-sizing: border-box;
+  text-align: center;
+  font-size: 11px;
+  color: var(--accent-pale);
+  padding: 4px 8px;
+  border-radius: 12px;
+  background: rgba(240, 163, 94, 0.1);
+  border: 1px solid rgba(240, 163, 94, 0.18);
+  font-family: inherit;
+  transition: border-color 0.15s;
+}
+.input-tag:focus {
+  border-color: rgba(240, 163, 94, 0.5);
+}
+
+/* ── 排版片段 ─────────────────────────────────────────── */
+
+.label-section {
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  color: var(--accent-deep);
+}
+
+.page-title {
+  font-family: var(--font-serif);
+  font-size: 26px;
+  font-weight: 600;
+}
+
+.page-sub {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-top: 8px;
+  line-height: 1.7;
+}
+
+.serif {
+  font-family: var(--font-serif);
+}
+
+/* 提示条 */
+.note-ok {
+  padding: 16px 20px;
+  border-radius: 12px;
+  background: rgba(143, 214, 160, 0.05);
+  border: 1px solid rgba(143, 214, 160, 0.15);
+  font-size: 12.5px;
+  color: #9dbfa5;
+  line-height: 1.7;
+}
+
+.note-warn {
+  padding: 16px 20px;
+  border-radius: 12px;
+  background: rgba(224, 185, 106, 0.06);
+  border: 1px solid rgba(224, 185, 106, 0.28);
+}
+
+.hint-inline {
+  font-size: 11.5px;
+  color: var(--text-dim-4);
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* ── 消息内容块（PRD §3.5 / 验收标准 19） ─────────────── */
+
+/* 动作、神态、心理活动与场景描写：浅色斜体，独立成行 */
+.block-action {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: 14px;
+  color: #a08a72;
+  line-height: 1.9;
+}
+
+/* 角色台词：正常字体与主要文字颜色，独立成行 */
+.block-dialogue {
+  font-family: var(--font-serif);
+  font-size: 16px;
+  line-height: 2.05;
+  color: var(--text-strong);
+  text-wrap: pretty;
+}
+
+/* 经典气泡版式下的台词 */
+.block-dialogue--bubble {
+  display: inline-block;
+  max-width: 85%;
+  padding: 14px 18px;
+  border-radius: 4px 18px 18px 18px;
+  background: #241a12;
+  border: 1px solid var(--line-2);
+  font-family: var(--font-serif);
+  font-size: 15.5px;
+  line-height: 1.95;
+  color: var(--text-strong);
+}
+
+/* 流式输出时的光标 */
+.stream-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  vertical-align: -0.12em;
+  margin-left: 2px;
+  background: var(--accent);
+  animation: caretBlink 1s steps(1, end) infinite;
+}
+
+/* ── 其他 ─────────────────────────────────────────────── */
+
+.log-row {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  padding: 9px 22px;
+  border-bottom: 1px solid rgba(255, 214, 170, 0.04);
+  flex-wrap: wrap;
+  transition: background 0.15s;
+}
+.log-row:hover {
+  background: rgba(240, 163, 94, 0.04);
+}
+
+/* 世界书条目启用开关 */
+.switch {
+  width: 38px;
+  height: 21px;
+  border-radius: 12px;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s;
+  flex: none;
+  border: none;
+  padding: 0;
+}
+.switch__knob {
+  position: absolute;
+  top: 2.5px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text);
+  transition: left 0.2s;
+  pointer-events: none;
+}

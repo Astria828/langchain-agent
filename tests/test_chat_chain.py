@@ -60,3 +60,22 @@ def test_basic_chat_chain_preserves_invalid_model_output_as_dialogue() -> None:
     assert len(output.blocks) == 1
     assert output.blocks[0].type == "dialogue"
     assert output.blocks[0].content == "她看向门口。\n你终于来了。"
+
+
+def test_basic_chat_chain_preserves_schema_invalid_json_as_dialogue() -> None:
+    """JSON 外形正确但内容块为空时也保留完整原文，覆盖 Parser 校验失败分支。"""
+
+    raw_response = '{"blocks":[{"type":"dialogue","content":"   "}]}'
+    gateway = StubGateway(raw_response)
+    chain = build_basic_chat_chain(
+        gateway=gateway,
+        base_url="https://models.example/v1",
+        model="chat-model",
+        api_key="secret",
+    )
+
+    output = asyncio.run(chain.ainvoke([{"role": "user", "content": "继续"}]))
+
+    assert len(output.blocks) == 1
+    assert output.blocks[0].type == "dialogue"
+    assert output.blocks[0].content == raw_response

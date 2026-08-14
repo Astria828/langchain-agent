@@ -223,7 +223,19 @@ class Message(Base):
             name="ck_messages_retrieved_only_assistant",
         ),
         Index("ux_messages_position", "session_id", "position", unique=True),
+        Index(
+            "ux_messages_turn_role",
+            "session_id",
+            "turn_number",
+            "role",
+            unique=True,
+            sqlite_where=text("turn_number IS NOT NULL"),
+        ),
         Index("ix_messages_session_created", "session_id", "created_at", "position"),
+        CheckConstraint(
+            "turn_number IS NULL OR turn_number > 0",
+            name="ck_messages_turn_number",
+        ),
     )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=new_id)
@@ -231,6 +243,7 @@ class Message(Base):
         Text, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
+    turn_number: Mapped[int | None] = mapped_column(Integer)
     role: Mapped[str] = mapped_column(Text, nullable=False)
     retrieved_entries_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(Text, nullable=False, default=utc_now)

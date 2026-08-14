@@ -1,8 +1,10 @@
 """FastAPI 应用入口、中间件和健康检查。"""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from time import perf_counter
 from typing import Literal
 from uuid import uuid4
 
@@ -15,7 +17,7 @@ from app.api.content import router as content_router
 from app.api.system import router as system_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
-from app.core.logging import configure_logging
+from app.core.logging import bind_request_id, configure_logging, reset_request_id
 from app.db.database import create_database_engine, create_session_factory
 from app.schemas.dto import DataResponse
 from app.tasks.memory_task import (
@@ -23,6 +25,12 @@ from app.tasks.memory_task import (
     run_pending_memory_tasks,
 )
 from app.tasks.rebuild_index_task import recover_interrupted_index_rebuilds
+from app.tasks.vector_cleanup_task import (
+    recover_interrupted_vector_cleanup_tasks,
+    run_pending_vector_cleanup_tasks,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class HealthData(BaseModel):
@@ -45,24 +53,32 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
         """启动时恢复中断任务；数据库尚未初始化时仍允许健康检查启动。"""
 
-        memory_runner: asyncio.Task[None] | None = None
+        background_runner: asyncio.Task[None] | None = None
         if settings.database_path.exists():
             engine = create_database_engine(settings)
             try:
                 with create_session_factory(engine)() as session:
                     recover_interrupted_index_rebuilds(session)
                     recover_interrupted_memory_tasks(session)
+                    recover_interrupted_vector_cleanup_tasks(session)
             finally:
                 engine.dispose()
-            memory_runner = asyncio.create_task(run_pending_memory_tasks(settings))
+
+            async def run_recoverable_tasks() -> None:
+                """依次处理记忆整理及其可能产生的残留向量清理。"""
+
+                await run_pending_memory_tasks(settings)
+                await run_pending_vector_cleanup_tasks(settings)
+
+            background_runner = asyncio.create_task(run_recoverable_tasks())
         try:
             yield
         finally:
-            if memory_runner is not None:
-                if not memory_runner.done():
-                    memory_runner.cancel()
+            if background_runner is not None:
+                if not background_runner.done():
+                    background_runner.cancel()
                 with suppress(asyncio.CancelledError):
-                    await memory_runner
+                    await background_runner
 
     application = FastAPI(
         title=settings.app_name,
@@ -83,13 +99,42 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
 
     @application.middleware("http")
     async def request_id_middleware(request: Request, call_next):
-        """为每次请求生成独立 ID，并同时写入响应头。"""
+        """为请求绑定链路 ID，并记录不含正文和查询参数的完成事件。"""
 
         request_id = f"req_{uuid4().hex}"
         request.state.request_id = request_id
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        return response
+        token = bind_request_id(request_id)
+        started_at = perf_counter()
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            logger.info(
+                "HTTP 请求处理完成",
+                extra={
+                    "event": "http_request_completed",
+                    "business_ids": {
+                        "method": request.method,
+                        "path": request.url.path,
+                        "statusCode": response.status_code,
+                        "durationMs": round((perf_counter() - started_at) * 1000),
+                    },
+                },
+            )
+            return response
+        except Exception:
+            logger.exception(
+                "HTTP 请求处理失败",
+                extra={
+                    "event": "http_request_failed",
+                    "business_ids": {
+                        "method": request.method,
+                        "path": request.url.path,
+                    },
+                },
+            )
+            raise
+        finally:
+            reset_request_id(token)
 
     register_exception_handlers(application)
     application.include_router(chat_router)

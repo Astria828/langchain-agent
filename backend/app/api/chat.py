@@ -3,10 +3,9 @@
 import json
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session as DatabaseSession
-from starlette.background import BackgroundTask as ResponseBackgroundTask
 
 from app.api.system import get_chroma_repository, get_model_gateway
 from app.db.database import get_db_session
@@ -19,6 +18,7 @@ from app.schemas.dto import (
     MemoryStatus,
     MemoryType,
     Message,
+    RecommendedReplyOutput,
     SendMessagePayload,
     Session,
     UpdateSessionPayload,
@@ -26,6 +26,7 @@ from app.schemas.dto import (
 from app.services.chat_service import ChatService
 from app.services.memory_service import MemoryService
 from app.tasks.memory_task import run_pending_memory_tasks
+from app.tasks.vector_cleanup_task import run_pending_vector_cleanup_tasks
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -106,11 +107,18 @@ def update_session(
 )
 def delete_session(
     session_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
     service: Annotated[ChatService, Depends(get_chat_service)],
 ) -> Response:
     """删除会话、上下文快照、消息和快照向量。"""
 
     service.delete_session(session_id)
+    background_tasks.add_task(
+        run_pending_vector_cleanup_tasks,
+        request.app.state.settings,
+        service.chroma,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -127,6 +135,39 @@ def list_messages(
 
     return DataResponse(
         data=service.list_messages(session_id),
+        request_id=request.state.request_id,
+    )
+
+
+@router.delete(
+    "/sessions/{session_id}/turns/{assistant_message_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+def delete_turn(
+    session_id: str,
+    assistant_message_id: str,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> Response:
+    """物理删除最后一轮用户消息和助手回复。"""
+
+    service.delete_turn(session_id, assistant_message_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/sessions/{session_id}/recommended-reply",
+    response_model=DataResponse[RecommendedReplyOutput],
+)
+async def recommended_reply(
+    session_id: str,
+    request: Request,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> DataResponse[RecommendedReplyOutput]:
+    """生成一条不落库、不自动发送的用户侧推荐回复。"""
+
+    return DataResponse(
+        data=await service.generate_recommended_reply(session_id),
         request_id=request.state.request_id,
     )
 
@@ -161,14 +202,21 @@ def list_memories(
 def invalidate_memory(
     memory_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     service: Annotated[MemoryService, Depends(get_memory_service)],
 ) -> DataResponse[LongTermMemory]:
     """幂等标记长期记忆失效，并在提交后清理向量。"""
 
-    return DataResponse(
+    response = DataResponse(
         data=service.invalidate_memory(memory_id),
         request_id=request.state.request_id,
     )
+    background_tasks.add_task(
+        run_pending_vector_cleanup_tasks,
+        request.app.state.settings,
+        service.chroma,
+    )
+    return response
 
 
 @router.post(
@@ -179,11 +227,12 @@ async def send_message(
     session_id: str,
     payload: SendMessagePayload,
     request: Request,
+    background_tasks: BackgroundTasks,
     service: Annotated[ChatService, Depends(get_chat_service)],
 ) -> StreamingResponse:
     """保存用户输入，执行双 RAG，并以 SSE 返回角色回复。"""
 
-    messages, config, api_key, retrieved_entries = await service.prepare_chat_turn(
+    messages, config, api_key, retrieved_entries, user_message_id = await service.prepare_chat_turn(
         session_id,
         payload,
     )
@@ -197,6 +246,59 @@ async def send_message(
             config,
             api_key,
             retrieved_entries,
+            user_message_id,
+        ):
+            data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            yield f"data: {data}\n\n"
+
+    background_tasks.add_task(
+        run_pending_memory_tasks,
+        request.app.state.settings,
+        service.gateway,
+        service.chroma,
+    )
+    background_tasks.add_task(
+        run_pending_vector_cleanup_tasks,
+        request.app.state.settings,
+        service.chroma,
+    )
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream; charset=utf-8",
+        headers={"Cache-Control": "no-cache"},
+        background=background_tasks,
+    )
+
+
+async def _message_action_response(
+    *,
+    session_id: str,
+    assistant_message_id: str,
+    action: str,
+    service: ChatService,
+) -> StreamingResponse:
+    """准备并编码重说或继续说的统一 SSE 响应。"""
+
+    messages, config, api_key, retrieved_entries, signature = (
+        await service.prepare_message_action(
+            session_id,
+            assistant_message_id,
+            action,
+        )
+    )
+
+    async def event_stream():
+        """把消息操作事件编码为 UTF-8 SSE 数据帧。"""
+
+        async for event in service.stream_message_action(
+            session_id,
+            assistant_message_id,
+            action,
+            messages,
+            config,
+            api_key,
+            retrieved_entries,
+            signature,
         ):
             data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
             yield f"data: {data}\n\n"
@@ -205,10 +307,42 @@ async def send_message(
         event_stream(),
         media_type="text/event-stream; charset=utf-8",
         headers={"Cache-Control": "no-cache"},
-        background=ResponseBackgroundTask(
-            run_pending_memory_tasks,
-            request.app.state.settings,
-            service.gateway,
-            service.chroma,
-        ),
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/messages/{assistant_message_id}/regenerate",
+    response_class=StreamingResponse,
+)
+async def regenerate_message(
+    session_id: str,
+    assistant_message_id: str,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> StreamingResponse:
+    """重新生成并原位覆盖最后一条助手回复。"""
+
+    return await _message_action_response(
+        session_id=session_id,
+        assistant_message_id=assistant_message_id,
+        action="regenerate",
+        service=service,
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/messages/{assistant_message_id}/continue",
+    response_class=StreamingResponse,
+)
+async def continue_message(
+    session_id: str,
+    assistant_message_id: str,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> StreamingResponse:
+    """继续生成并追加到最后一条助手回复。"""
+
+    return await _message_action_response(
+        session_id=session_id,
+        assistant_message_id=assistant_message_id,
+        action="continue",
+        service=service,
     )

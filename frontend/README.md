@@ -6,26 +6,17 @@
 ## 启动
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-打开 http://localhost:5173 。默认使用阶段式适配：模型配置、用户身份和角色卡需要后端，其余页面继续使用 Mock。
+打开 http://localhost:5173。九个页面均固定访问真实后端，请先启动根目录 README 中的 FastAPI 服务。
 
 其他命令：`npm run build`（含类型检查）、`npm run typecheck`。
 
-## Mock 与真实后端切换
+## 后端连接
 
-`.env.example` 里只有一个开关：
-
-| VITE_USE_MOCK | 行为 |
-| --- | --- |
-| `true`（缺省值） | 阶段式模式：模型配置、身份和角色卡走真实后端，其余业务走 Mock |
-| `false` | 走真实 REST/SSE，由 `vite.config.ts` 的 `^/api/` 代理转发到 `http://localhost:8000` |
-
-每完成一个开发阶段，就在阶段式客户端中将对应业务域切换到真实接口。阶段 4–8 全部落地后可改成 `false`；`mockApi` 与 `realApi` 实现的是 `src/services/api.ts` 里同一个 `ApiClient` 契约。
-
-清空本地 mock 数据：浏览器控制台执行 `__loreweaveResetMock()`。
+开发服务器由 `vite.config.ts` 将 `/api/` 请求代理到 `http://localhost:8000`。阶段 9 已移除运行时 Mock 选择逻辑，`.env.example` 不再要求配置开关；`services/mock/` 仅保留为早期设计数据参考，不参与应用运行。
 
 ## 目录
 

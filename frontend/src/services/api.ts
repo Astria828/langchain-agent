@@ -19,6 +19,7 @@ import type {
   LogQuery,
   LongTermMemory,
   Message,
+  RecommendedReply,
   MemoryStatus,
   MemoryType,
   ModelEndpointPayload,
@@ -32,7 +33,6 @@ import type {
   WorldBookDraftEntry,
   WorldBookEntry,
 } from '@/types';
-import { mockApi } from './mock/mockApi';
 
 const BASE = '/api';
 
@@ -112,6 +112,8 @@ export interface ApiClient {
   updateSession(id: string, patch: Partial<Pick<Session, 'title'>>): Promise<Session>;
   deleteSession(id: string): Promise<void>;
   listMessages(sessionId: string): Promise<Message[]>;
+  deleteTurn(sessionId: string, assistantMessageId: string): Promise<void>;
+  recommendedReply(sessionId: string): Promise<RecommendedReply>;
 
   /* 长期记忆 */
   listMemories(query?: {
@@ -179,6 +181,10 @@ export const realApi: ApiClient = {
   updateSession: (id, patch) => request(`/sessions/${id}`, { method: 'PATCH', ...json(patch) }),
   deleteSession: (id) => request(`/sessions/${id}`, { method: 'DELETE' }),
   listMessages: (sessionId) => request(`/sessions/${sessionId}/messages`),
+  deleteTurn: (sessionId, assistantMessageId) =>
+    request(`/sessions/${sessionId}/turns/${assistantMessageId}`, { method: 'DELETE' }),
+  recommendedReply: (sessionId) =>
+    request(`/sessions/${sessionId}/recommended-reply`, { method: 'POST' }),
 
   listMemories: (query) =>
     request(
@@ -203,42 +209,5 @@ export const realApi: ApiClient = {
   exportAll: () => download('/export/all'),
 };
 
-/**
- * 阶段 5 起，会话 CRUD、历史消息与实时生成固定访问真实后端。
- * VITE_USE_MOCK=false 仍表示全部业务域切换到真实接口。
- */
-export const useMock = import.meta.env.VITE_USE_MOCK !== 'false';
-
-const stagedApi: ApiClient = {
-  ...mockApi,
-  getIdentity: realApi.getIdentity,
-  updateIdentity: realApi.updateIdentity,
-  listCharacters: realApi.listCharacters,
-  createCharacter: realApi.createCharacter,
-  updateCharacter: realApi.updateCharacter,
-  deleteCharacter: realApi.deleteCharacter,
-  listWorldBooks: realApi.listWorldBooks,
-  createWorldBook: realApi.createWorldBook,
-  updateWorldBook: realApi.updateWorldBook,
-  deleteWorldBook: realApi.deleteWorldBook,
-  splitWorldBook: realApi.splitWorldBook,
-  confirmDrafts: realApi.confirmDrafts,
-  createEntry: realApi.createEntry,
-  updateEntry: realApi.updateEntry,
-  deleteEntry: realApi.deleteEntry,
-  reembed: realApi.reembed,
-  listSessions: realApi.listSessions,
-  createSession: realApi.createSession,
-  updateSession: realApi.updateSession,
-  deleteSession: realApi.deleteSession,
-  listMessages: realApi.listMessages,
-  listMemories: realApi.listMemories,
-  invalidateMemory: realApi.invalidateMemory,
-  getModelSettings: realApi.getModelSettings,
-  testConnection: realApi.testConnection,
-  saveModelSettings: realApi.saveModelSettings,
-  getIndexStatus: realApi.getIndexStatus,
-  rebuildIndex: realApi.rebuildIndex,
-};
-
-export const client: ApiClient = useMock ? stagedApi : realApi;
+/** 阶段 9 起九个页面固定访问真实 REST API，聊天流固定访问真实 SSE。 */
+export const client: ApiClient = realApi;

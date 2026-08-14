@@ -13,7 +13,7 @@ def ensure_runtime_directories(settings: Settings) -> None:
     """创建规范约定的运行目录，不覆盖其中已有内容。"""
 
     data_dir = settings.resolved_data_dir
-    for path in (data_dir, data_dir / "chroma", data_dir / "logs", data_dir / "exports"):
+    for path in (data_dir, settings.chroma_dir, settings.logs_dir, settings.exports_dir):
         path.mkdir(parents=True, exist_ok=True)
 
 

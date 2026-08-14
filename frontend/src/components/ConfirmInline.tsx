@@ -11,6 +11,7 @@ interface Props {
   layout?: 'row' | 'inline';
   onConfirm: () => void;
   onCancel: () => void;
+  confirmLabel?: string;
   style?: React.CSSProperties;
 }
 
@@ -25,6 +26,7 @@ export default function ConfirmInline({
   layout = 'row',
   onConfirm,
   onCancel,
+  confirmLabel = '删除',
   style,
 }: Props) {
   const t = TONES[tone];
@@ -52,7 +54,7 @@ export default function ConfirmInline({
           onClick={onConfirm}
           style={{ flex: 'none', fontSize: 12, padding: '6px 16px', borderRadius: 16 }}
         >
-          删除
+          {confirmLabel}
         </button>
         <button
           className="btn-cancel"
@@ -78,7 +80,7 @@ export default function ConfirmInline({
       <div style={{ fontSize: 11.5, color: '#d9b0a4', lineHeight: 1.6 }}>{text}</div>
       <div style={{ display: 'flex', gap: 8, marginTop: 9 }}>
         <button className="btn-danger" onClick={onConfirm} style={{ flex: 1, fontSize: 12, padding: '6px 0' }}>
-          删除
+          {confirmLabel}
         </button>
         <button className="btn-cancel" onClick={onCancel} style={{ flex: 1, fontSize: 12, padding: '6px 0' }}>
           取消

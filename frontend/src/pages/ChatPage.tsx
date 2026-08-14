@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
+import ConfirmInline from '@/components/ConfirmInline';
 import MessageBlocks from '@/components/MessageBlocks';
 import ResizableDivider, { useResizablePanel } from '@/components/ResizableDivider';
 import SessionList from '@/components/SessionList';
@@ -19,6 +20,9 @@ export default function ChatPage() {
   const [listOpen, setListOpen] = useState(true);
   const [draft, setDraft] = useState('');
   const [titleDraft, setTitleDraft] = useState('');
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [deletingTurn, setDeletingTurn] = useState(false);
+  const [recommending, setRecommending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sessionPanel = useResizablePanel({
     storageKey: 'loreweave.layout.sessionListWidth',
@@ -32,16 +36,30 @@ export default function ChatPage() {
   const worldBook = useAppStore(selectCurrentWorldBook);
   const contextHint = useAppStore(selectContextHint);
   const messages = useAppStore((s) => s.messages);
+  const sessionsLoading = useAppStore((s) => s.sessionsLoading);
+  const sessionsError = useAppStore((s) => s.sessionsError);
+  const loadSessions = useAppStore((s) => s.loadSessions);
   const streaming = useAppStore((s) => s.streaming);
   const streamRetrieved = useAppStore((s) => s.streamRetrieved);
+  const messageActionPending = useAppStore((s) => s.messageActionPending);
   const chatStyle = useAppStore((s) => s.chatStyle);
   const showRagHints = useAppStore((s) => s.showRagHints);
   const identity = useAppStore((s) => s.identity);
   const renameSession = useAppStore((s) => s.renameSession);
+  const removeTurn = useAppStore((s) => s.removeTurn);
+  const runMessageAction = useAppStore((s) => s.runMessageAction);
+  const recommendReply = useAppStore((s) => s.recommendReply);
   const send = useAppStore((s) => s.send);
 
   const hasSession = !!session;
   const characterName = character?.name ?? '';
+  const busy = !!streaming || !!messageActionPending || deletingTurn || recommending;
+  const latestMessage = messages[messages.length - 1];
+  const previousMessage = messages[messages.length - 2];
+  const actionableMessageId =
+    session && latestMessage?.role === 'assistant' && previousMessage?.role === 'user'
+      ? latestMessage.id
+      : null;
 
   const chatMeta = session
     ? `${characterName} · ${worldBook?.name ?? '未绑定世界书'} · 基础对话`
@@ -59,9 +77,20 @@ export default function ChatPage() {
 
   const submit = () => {
     const text = draft.trim();
-    if (!text || streaming) return;
+    if (!text || busy) return;
     setDraft('');
     void send(text);
+  };
+
+  const fillRecommendedReply = async () => {
+    if (draft.trim() || busy) return;
+    setRecommending(true);
+    try {
+      const content = await recommendReply();
+      if (content) setDraft(content);
+    } finally {
+      setRecommending(false);
+    }
   };
 
   return (
@@ -150,9 +179,21 @@ export default function ChatPage() {
               }}
             >
               <div className="serif" style={{ fontSize: 16 }}>
-                还没有对话
+                {sessionsLoading ? '正在读取对话…' : sessionsError ? '对话加载失败' : '还没有对话'}
               </div>
-              <div style={{ fontSize: 12.5 }}>点击左侧「＋ 新建对话」，选择角色与世界书后开始</div>
+              <div style={{ fontSize: 12.5 }}>
+                {sessionsError ?? '点击左侧「＋ 新建对话」，选择角色与世界书后开始'}
+              </div>
+              {sessionsError && (
+                <button
+                  className="btn-ghost"
+                  onClick={() => void loadSessions()}
+                  disabled={sessionsLoading}
+                  style={{ fontSize: 12.5, padding: '8px 16px' }}
+                >
+                  {sessionsLoading ? '正在重试…' : '重试'}
+                </button>
+              )}
             </div>
           )}
 
@@ -175,6 +216,29 @@ export default function ChatPage() {
                   userName={identity?.name ?? ''}
                   chatStyle={chatStyle}
                   showRagHints={showRagHints}
+                  actions={
+                    message.id === actionableMessageId
+                      ? {
+                          pendingAction:
+                            messageActionPending?.messageId === message.id
+                              ? messageActionPending.action
+                              : null,
+                          confirmDelete: deleteConfirmId === message.id,
+                          disabled: busy,
+                          onRegenerate: () => void runMessageAction(message.id, 'regenerate'),
+                          onContinue: () => void runMessageAction(message.id, 'continue'),
+                          onDeleteRequest: () => setDeleteConfirmId(message.id),
+                          onDeleteCancel: () => setDeleteConfirmId(null),
+                          onDeleteConfirm: () => {
+                            setDeletingTurn(true);
+                            void removeTurn(message.id).finally(() => {
+                              setDeletingTurn(false);
+                              setDeleteConfirmId(null);
+                            });
+                          },
+                        }
+                      : undefined
+                  }
                 />
               ))}
               {streaming && (
@@ -211,7 +275,16 @@ export default function ChatPage() {
               border: '1px solid var(--line-4)',
               boxShadow: '0 8px 40px rgba(0,0,0,.4)',
             }}
-          >
+            >
+            <button
+              className="btn-ghost"
+              onClick={() => void fillRecommendedReply()}
+              disabled={!hasSession || busy || !!draft.trim()}
+              title={draft.trim() ? '请先清空输入框' : '生成一句可编辑的用户回复'}
+              style={{ flex: 'none', fontSize: 12, padding: '8px 10px' }}
+            >
+              {recommending ? '生成中…' : '推荐回复'}
+            </button>
             <textarea
               rows={1}
               value={draft}
@@ -222,7 +295,7 @@ export default function ChatPage() {
                   submit();
                 }
               }}
-              disabled={!hasSession}
+              disabled={!hasSession || busy}
               placeholder={hasSession ? '以你的身份继续故事…（Enter 发送）' : '请先新建一个对话'}
               style={{
                 flex: 1,
@@ -239,7 +312,7 @@ export default function ChatPage() {
             />
             <button
               onClick={submit}
-              disabled={!hasSession || !!streaming}
+              disabled={!hasSession || busy}
               style={{
                 flex: 'none',
                 width: 40,
@@ -249,7 +322,7 @@ export default function ChatPage() {
                 background: hasSession ? 'var(--grad-accent)' : 'rgba(255,214,170,.08)',
                 color: hasSession ? 'var(--on-accent)' : 'var(--text-dim-4)',
                 fontSize: 17,
-                cursor: hasSession && !streaming ? 'pointer' : 'not-allowed',
+                cursor: hasSession && !busy ? 'pointer' : 'not-allowed',
                 boxShadow: hasSession ? '0 0 18px rgba(240,163,94,.35)' : 'none',
               }}
             >
@@ -281,6 +354,16 @@ interface RowProps {
   showRagHints: boolean;
   retrievedOverride?: string[];
   streaming?: boolean;
+  actions?: {
+    pendingAction: 'regenerate' | 'continue' | null;
+    confirmDelete: boolean;
+    disabled: boolean;
+    onRegenerate: () => void;
+    onContinue: () => void;
+    onDeleteRequest: () => void;
+    onDeleteCancel: () => void;
+    onDeleteConfirm: () => void;
+  };
 }
 
 function MessageRow({
@@ -291,6 +374,7 @@ function MessageRow({
   showRagHints,
   retrievedOverride,
   streaming = false,
+  actions,
 }: RowProps) {
   const bubble = chatStyle === '经典气泡';
 
@@ -361,6 +445,47 @@ function MessageRow({
             {characterName}
           </div>
           <MessageBlocks blocks={message.blocks} chatStyle={chatStyle} streaming={streaming} />
+          {actions && (
+            <div style={{ marginTop: 12 }}>
+              {!actions.confirmDelete && (
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <button
+                    className="btn-ghost"
+                    onClick={actions.onRegenerate}
+                    disabled={actions.disabled}
+                    style={{ fontSize: 11.5, padding: '6px 10px' }}
+                  >
+                    {actions.pendingAction === 'regenerate' ? '正在重说…' : '重说'}
+                  </button>
+                  <button
+                    className="btn-ghost"
+                    onClick={actions.onContinue}
+                    disabled={actions.disabled}
+                    style={{ fontSize: 11.5, padding: '6px 10px' }}
+                  >
+                    {actions.pendingAction === 'continue' ? '正在继续…' : '继续说'}
+                  </button>
+                  <button
+                    className="btn-cancel"
+                    onClick={actions.onDeleteRequest}
+                    disabled={actions.disabled}
+                    style={{ fontSize: 11.5, padding: '6px 10px' }}
+                  >
+                    删除本轮
+                  </button>
+                </div>
+              )}
+              {actions.confirmDelete && (
+                <ConfirmInline
+                  layout="inline"
+                  text="该轮用户消息和角色回复将被永久删除。"
+                  onConfirm={actions.onDeleteConfirm}
+                  onCancel={actions.onDeleteCancel}
+                  style={{ marginTop: 4 }}
+                />
+              )}
+            </div>
+          )}
         </div>
       </div>
     );

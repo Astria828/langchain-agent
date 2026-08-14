@@ -13,20 +13,39 @@ import type { Message } from '@/types';
  * 导出为只读操作，不修改会话状态、记忆整理进度或向量索引。
  */
 
+/** 生成不含 Windows 非法字符的本地下载时间戳。 */
+const downloadTimestamp = () => {
+  const now = new Date();
+  const twoDigits = (value: number) => String(value).padStart(2, '0');
+  return `${now.getFullYear()}${twoDigits(now.getMonth() + 1)}${twoDigits(now.getDate())}-${twoDigits(now.getHours())}${twoDigits(now.getMinutes())}${twoDigits(now.getSeconds())}`;
+};
+
 export default function DataPage() {
   const characters = useAppStore((s) => s.characters);
   const sessions = useAppStore((s) => s.sessions);
+  const sessionsLoading = useAppStore((s) => s.sessionsLoading);
+  const sessionsError = useAppStore((s) => s.sessionsError);
+  const loadSessions = useAppStore((s) => s.loadSessions);
   const memories = useAppStore((s) => s.memories);
-  const identity = useAppStore((s) => s.identity);
+  const memoriesLoading = useAppStore((s) => s.memoriesLoading);
+  const memoriesError = useAppStore((s) => s.memoriesError);
+  const loadMemories = useAppStore((s) => s.loadMemories);
   const flash = useAppStore((s) => s.flash);
 
   const [characterId, setCharacterId] = useState(() => characters[0]?.id ?? '');
   const [openId, setOpenId] = useState<string | null>(null);
   const [openMessages, setOpenMessages] = useState<Message[]>([]);
+  const [openLoading, setOpenLoading] = useState(false);
+  const [openError, setOpenError] = useState(false);
 
   useEffect(() => {
     if (!characters.some((c) => c.id === characterId)) setCharacterId(characters[0]?.id ?? '');
   }, [characters, characterId]);
+
+  // 记忆页使用筛选查询，进入数据管理时重新读取全量，避免统计沿用上一页的筛选结果。
+  useEffect(() => {
+    void loadMemories();
+  }, [loadMemories]);
 
   const list = sessions.filter((s) => s.characterId === characterId);
   const character = characters.find((c) => c.id === characterId);
@@ -36,7 +55,11 @@ export default function DataPage() {
     { label: '累计对话轮次', value: String(list.reduce((a, s) => a + s.roundCount, 0)) },
     {
       label: '关联长期记忆',
-      value: `${memories.filter((m) => m.characterId === characterId).length} 条`,
+      value: memoriesLoading
+        ? '…'
+        : memoriesError
+          ? '—'
+          : `${memories.filter((m) => m.characterId === characterId).length} 条`,
     },
   ];
 
@@ -44,21 +67,28 @@ export default function DataPage() {
     if (openId === id) {
       setOpenId(null);
       setOpenMessages([]);
+      setOpenLoading(false);
+      setOpenError(false);
       return;
     }
     setOpenId(id);
     setOpenMessages([]);
+    setOpenLoading(true);
+    setOpenError(false);
     try {
       const messages = await client.listMessages(id);
       setOpenMessages(messages);
     } catch {
+      setOpenError(true);
       flash('会话消息载入失败');
+    } finally {
+      setOpenLoading(false);
     }
   };
 
   const exportOne = async (id: string, title: string) => {
     try {
-      saveBlob(await client.exportSession(id), `${title}.json`);
+      saveBlob(await client.exportSession(id), `loreweave-session-${id}.json`);
       flash(`已导出「${title}」· JSON`);
     } catch {
       flash('导出失败');
@@ -67,7 +97,7 @@ export default function DataPage() {
 
   const exportAll = async () => {
     try {
-      saveBlob(await client.exportAll(), 'loreweave-export.zip');
+      saveBlob(await client.exportAll(), `loreweave-export-${downloadTimestamp()}.zip`);
       flash('已导出全部数据 ZIP · 角色卡、世界书、记忆与对话记录');
     } catch {
       flash('导出失败');
@@ -119,9 +149,33 @@ export default function DataPage() {
             setCharacterId(id);
             setOpenId(null);
             setOpenMessages([]);
+            setOpenLoading(false);
+            setOpenError(false);
           }}
           style={{ marginBottom: 20 }}
         />
+
+        {sessionsLoading && sessions.length === 0 && (
+          <div className="note-ok" style={{ marginBottom: 18 }}>正在读取会话归档…</div>
+        )}
+        {sessionsError && sessions.length === 0 && (
+          <div className="note-warn" style={{ marginBottom: 18 }}>
+            会话归档加载失败：{sessionsError}
+            <button
+              className="btn-ghost"
+              onClick={() => void loadSessions()}
+              disabled={sessionsLoading}
+              style={{ marginLeft: 12, fontSize: 12 }}
+            >
+              重试
+            </button>
+          </div>
+        )}
+        {memoriesError && (
+          <div className="note-warn" style={{ marginBottom: 18 }}>
+            长期记忆统计暂不可用：{memoriesError}
+          </div>
+        )}
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           {list.map((s) => (
@@ -143,7 +197,9 @@ export default function DataPage() {
                   {s.roundCount} 轮
                 </span>
                 <div style={{ flex: 1 }} />
-                <span style={{ fontSize: 11.5, color: 'var(--text-dim-3)' }}>{s.updatedAt}</span>
+                <span style={{ fontSize: 11.5, color: 'var(--text-dim-3)' }}>
+                  最后活动 {s.updatedAt}
+                </span>
                 <button
                   className="btn-ghost"
                   onClick={() => void toggle(s.id)}
@@ -166,6 +222,27 @@ export default function DataPage() {
                 {s.summary}
               </div>
 
+              <div
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '5px 16px',
+                  marginTop: 10,
+                  fontSize: 11.5,
+                  color: 'var(--text-dim-3)',
+                }}
+              >
+                <span>
+                  身份：{s.identityName} · {s.identityPersonaName}
+                </span>
+                <span>角色：{s.characterName}</span>
+                <span>世界书：{s.worldBookName ?? '未绑定'}</span>
+                <span>创建时间：{s.createdAt}</span>
+                <span>
+                  记忆整理：{s.consolidatedRound} / {s.roundCount} 轮
+                </span>
+              </div>
+
               {openId === s.id && (
                 <div
                   style={{
@@ -179,10 +256,20 @@ export default function DataPage() {
                     gap: 12,
                   }}
                 >
-                  {openMessages.length === 0 && (
+                  {openLoading && (
                     <div style={{ fontSize: 12.5, color: 'var(--text-dim-4)' }}>载入中…</div>
                   )}
-                  {openMessages.map((m) => (
+                  {!openLoading && openError && (
+                    <div style={{ fontSize: 12.5, color: 'var(--lv-error)' }}>
+                      会话消息载入失败
+                    </div>
+                  )}
+                  {!openLoading && !openError && openMessages.length === 0 && (
+                    <div style={{ fontSize: 12.5, color: 'var(--text-dim-4)' }}>
+                      该会话暂无消息
+                    </div>
+                  )}
+                  {!openLoading && !openError && openMessages.map((m) => (
                     <div key={m.id} style={{ display: 'flex', gap: 12, fontSize: 12.5, lineHeight: 1.75 }}>
                       <span
                         style={{
@@ -192,7 +279,7 @@ export default function DataPage() {
                           fontWeight: 600,
                         }}
                       >
-                        {m.role === 'user' ? identity?.name : m.role === 'memo' ? '记忆' : character?.name}
+                        {m.role === 'user' ? s.identityName : m.role === 'memo' ? '记忆' : s.characterName}
                       </span>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                         {m.blocks.map((b) => (
@@ -215,7 +302,7 @@ export default function DataPage() {
             </div>
           ))}
 
-          {list.length === 0 && (
+          {!sessionsLoading && !sessionsError && list.length === 0 && (
             <div
               style={{
                 padding: 40,

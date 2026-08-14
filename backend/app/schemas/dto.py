@@ -235,6 +235,12 @@ class ReembedResult(ApiModel):
     count: Annotated[int, Field(ge=0)]
 
 
+class DeleteLogsResult(ApiModel):
+    """日志删除操作实际移除的记录数量。"""
+
+    count: Annotated[int, Field(ge=0)]
+
+
 class Session(ApiModel):
     """会话公开字段。"""
 
@@ -243,6 +249,10 @@ class Session(ApiModel):
     character_id: str
     world_book_id: str | None
     identity_snapshot_id: str
+    identity_name: str
+    identity_persona_name: str
+    character_name: str
+    world_book_name: str | None
     round_count: Annotated[int, Field(ge=0)]
     consolidated_round: Annotated[int, Field(ge=0)]
     summary: str
@@ -318,6 +328,14 @@ class Message(ApiModel):
     blocks: list[MessageBlock]
     created_at: str
     retrieved: list[str] = Field(default_factory=list)
+
+
+class RecommendedReplyOutput(ApiModel):
+    """根据当前会话生成、但尚未发送的用户侧推荐回复。"""
+
+    content: str
+
+    _validate_content = field_validator("content")(_non_blank)
 
 
 MemoryType = Literal["用户偏好", "角色承诺", "关系变化", "重要剧情", "长期目标"]
@@ -481,8 +499,10 @@ class LogEntry(ApiModel):
     time: str
     level: LogLevel
     module: str
+    event: str
     request_id: str
     message: str
+    business_ids: dict[str, str] = Field(default_factory=dict)
 
 
 ResponseData = TypeVar("ResponseData")

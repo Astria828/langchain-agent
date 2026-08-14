@@ -28,6 +28,9 @@ interface SessionListProps {
 export default function SessionList({ width }: SessionListProps) {
   const navigate = useNavigate();
   const sessions = useAppStore((s) => s.sessions);
+  const sessionsLoading = useAppStore((s) => s.sessionsLoading);
+  const sessionsError = useAppStore((s) => s.sessionsError);
+  const loadSessions = useAppStore((s) => s.loadSessions);
   const characters = useAppStore((s) => s.characters);
   const currentSessionId = useAppStore((s) => s.currentSessionId);
   const selectSession = useAppStore((s) => s.selectSession);
@@ -159,7 +162,17 @@ export default function SessionList({ width }: SessionListProps) {
               color: 'var(--text-dim-3)',
             }}
           >
-            没有匹配的对话
+            {sessionsLoading ? '正在读取对话…' : sessionsError ? '对话加载失败' : '没有匹配的对话'}
+            {sessionsError && (
+              <button
+                className="btn-ghost"
+                onClick={() => void loadSessions()}
+                disabled={sessionsLoading}
+                style={{ display: 'block', margin: '12px auto 0', fontSize: 11.5 }}
+              >
+                重试
+              </button>
+            )}
           </div>
         )}
       </div>

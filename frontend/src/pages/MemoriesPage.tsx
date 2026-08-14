@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 
+import ConfirmInline from '@/components/ConfirmInline';
 import FilterChips from '@/components/FilterChips';
 import PageHeader from '@/components/PageHeader';
 import { useAppStore } from '@/stores/appStore';
@@ -25,12 +26,15 @@ const stars = (importance: number) => '★'.repeat(importance) + '☆'.repeat(Ma
 export default function MemoriesPage() {
   const characters = useAppStore((s) => s.characters);
   const memories = useAppStore((s) => s.memories);
+  const memoriesLoading = useAppStore((s) => s.memoriesLoading);
+  const memoriesError = useAppStore((s) => s.memoriesError);
   const loadMemories = useAppStore((s) => s.loadMemories);
   const invalidateMemory = useAppStore((s) => s.invalidateMemory);
 
   const [characterId, setCharacterId] = useState(() => characters[0]?.id ?? '');
   const [type, setType] = useState<'all' | MemoryType>('all');
   const [status, setStatus] = useState<'all' | MemoryStatus>('all');
+  const [pendingInvalidate, setPendingInvalidate] = useState<string | null>(null);
 
   useEffect(() => {
     if (!characters.some((c) => c.id === characterId)) setCharacterId(characters[0]?.id ?? '');
@@ -90,14 +94,36 @@ export default function MemoriesPage() {
         />
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {memoriesLoading && memories.length === 0 && (
+            <div style={{ padding: 40, textAlign: 'center', fontSize: 13, color: 'var(--text-dim-4)' }}>
+              正在读取长期记忆…
+            </div>
+          )}
+          {memoriesError && (
+            <div className="note-warn">
+              长期记忆加载失败：{memoriesError}
+              <button
+                className="btn-ghost"
+                onClick={() => void loadMemories({
+                  characterId: characterId || undefined,
+                  type: type === 'all' ? undefined : type,
+                  status: status === 'all' ? undefined : status,
+                })}
+                disabled={memoriesLoading}
+                style={{ marginLeft: 12, fontSize: 12 }}
+              >
+                重试
+              </button>
+            </div>
+          )}
           {shown.map((m) => {
             const [fg, bg, bd] = TYPE_COLORS[m.type];
             return (
-              <div
-                key={m.id}
-                className="card"
-                style={{ padding: '20px 24px', display: 'flex', gap: 18, alignItems: 'flex-start' }}
-              >
+              <div key={m.id}>
+                <div
+                  className="card"
+                  style={{ padding: '20px 24px', display: 'flex', gap: 18, alignItems: 'flex-start' }}
+                >
                 <span
                   style={{
                     flex: 'none',
@@ -135,7 +161,7 @@ export default function MemoriesPage() {
                 </div>
                 <button
                   className="btn-dim-danger"
-                  onClick={() => void invalidateMemory(m.id)}
+                  onClick={() => setPendingInvalidate(m.id)}
                   disabled={m.status === '已失效'}
                   style={{
                     flex: 'none',
@@ -148,11 +174,25 @@ export default function MemoriesPage() {
                 >
                   标记失效
                 </button>
+                </div>
+                {pendingInvalidate === m.id && (
+                  <ConfirmInline
+                    text="标记失效后，该记忆将不再参与后续检索。确定继续？"
+                    confirmLabel="标记失效"
+                    layout="inline"
+                    onConfirm={() => {
+                      setPendingInvalidate(null);
+                      void invalidateMemory(m.id);
+                    }}
+                    onCancel={() => setPendingInvalidate(null)}
+                    style={{ marginTop: 8 }}
+                  />
+                )}
               </div>
             );
           })}
 
-          {shown.length === 0 && (
+          {!memoriesLoading && !memoriesError && shown.length === 0 && (
             <div
               style={{
                 padding: '40px',

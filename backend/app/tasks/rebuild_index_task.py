@@ -77,7 +77,13 @@ def recover_interrupted_index_rebuilds(session: Session) -> int:
         update(LongTermMemory).where(LongTermMemory.status == "active").values(**failed_values)
     )
     session.commit()
-    logger.warning("已恢复 %s 个中断的索引重建任务", len(task_ids))
+    logger.warning(
+        "已恢复中断的索引重建任务",
+        extra={
+            "event": "index_rebuilds_recovered",
+            "business_ids": {"count": len(task_ids)},
+        },
+    )
     return len(task_ids)
 
 
@@ -140,9 +146,26 @@ class RebuildIndexTask:
                 memory_bundle,
             )
             self._finish_success(task_id, target_version)
+            logger.info(
+                "索引重建任务完成",
+                extra={
+                    "event": "index_rebuild_completed",
+                    "business_ids": {
+                        "taskId": task_id,
+                        "targetVersion": target_version,
+                    },
+                },
+            )
         except Exception as exc:
             self._finish_failure(task_id)
-            logger.exception("索引重建任务失败 task_id=%s", task_id, exc_info=exc)
+            logger.exception(
+                "索引重建任务失败",
+                exc_info=exc,
+                extra={
+                    "event": "index_rebuild_failed",
+                    "business_ids": {"taskId": task_id},
+                },
+            )
             raise AppError(
                 status_code=500,
                 code="INDEX_OPERATION_FAILED",

@@ -119,7 +119,15 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
         request_id = _request_id(request)
-        logger.exception("未处理异常 request_id=%s", request_id, exc_info=exc)
+        logger.exception(
+            "未处理异常",
+            exc_info=exc,
+            extra={
+                "event": "unhandled_exception",
+                "request_id": request_id,
+                "business_ids": {},
+            },
+        )
         return _error_response(
             request=request,
             status_code=500,

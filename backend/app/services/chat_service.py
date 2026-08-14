@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DatabaseSession
 
-from app.chains.chat_chain import build_basic_chat_chain
+from app.chains.chat_chain import build_basic_chat_chain, build_recommended_reply_chain
 from app.core.exceptions import AppError
 from app.core.security import unprotect_api_key
 from app.db.models import (
@@ -40,6 +40,7 @@ from app.schemas.dto import (
     CreateSessionPayload,
     Message,
     MessageBlock,
+    RecommendedReplyOutput,
     SendMessagePayload,
     Session,
     UpdateSessionPayload,
@@ -47,6 +48,10 @@ from app.schemas.dto import (
 
 logger = logging.getLogger(__name__)
 RETRIEVAL_HISTORY_ROUNDS = 4
+CONTINUE_REPLY_INSTRUCTION = (
+    "继续上一条角色回复，从结束处自然续写。"
+    "不要重复已有内容，也不要假设用户产生了新的动作或台词。"
+)
 
 
 class ChatService:
@@ -141,6 +146,13 @@ class ChatService:
                     "会话世界书快照索引失败 session_id=%s code=%s",
                     chat_session.id,
                     exc.code,
+                    extra={
+                        "event": "session_snapshot_index_failed",
+                        "business_ids": {
+                            "sessionId": chat_session.id,
+                            "errorCode": exc.code,
+                        },
+                    },
                 )
 
         return self._session_to_dto(chat_session)
@@ -187,11 +199,137 @@ class ChatService:
         ).all()
         return [self._message_to_dto(message) for message in messages]
 
+    def delete_turn(self, session_id: str, assistant_message_id: str) -> None:
+        """物理删除最后一轮；已整理轮次保留累计轮次和既有长期记忆。"""
+
+        chat_session, user_message, assistant_message = self._get_mutable_last_turn(
+            session_id,
+            assistant_message_id,
+        )
+        turn_number = assistant_message.turn_number
+        if turn_number is None:
+            raise RuntimeError("完整助手回复缺少轮次编号")
+        if turn_number > chat_session.consolidated_round:
+            chat_session.round_count -= 1
+        chat_session.updated_at = utc_now()
+        self.repository.delete(assistant_message)
+        self.repository.delete(user_message)
+        self.session.commit()
+
+    async def prepare_message_action(
+        self,
+        session_id: str,
+        assistant_message_id: str,
+        action: str,
+    ) -> tuple[list[dict[str, str]], ModelConfig, str, list[str], str]:
+        """为最后一条助手回复准备重说或继续说上下文。"""
+
+        if action not in {"regenerate", "continue"}:
+            raise ValueError("不支持的消息操作")
+        chat_session, user_message, assistant_message = self._get_mutable_last_turn(
+            session_id,
+            assistant_message_id,
+        )
+        context_snapshot = self._get_context_snapshot(session_id)
+        config, api_key = self._require_main_model_config()
+        embedding_config = self._get_embedding_config()
+        if embedding_config.rebuild_required:
+            raise AppError(
+                status_code=503,
+                code="INDEX_REBUILD_REQUIRED",
+                message="Embedding 索引需要完成重建后才能继续对话",
+            )
+
+        current_input = self._history_message_to_model(user_message)["content"]
+        worldbook_entries, memories = await self._retrieve_reply_context(
+            chat_session=chat_session,
+            current_user_message_id=user_message.id,
+            current_input=current_input,
+            embedding_config=embedding_config,
+        )
+        excluded_message_ids = (
+            (user_message.id, assistant_message.id) if action == "regenerate" else ()
+        )
+        messages = self._build_basic_chat_messages(
+            session_id=session_id,
+            current_user_message_id=user_message.id,
+            current_input=(
+                current_input if action == "regenerate" else CONTINUE_REPLY_INSTRUCTION
+            ),
+            context_snapshot=context_snapshot,
+            worldbook_entries=worldbook_entries,
+            memories=memories,
+            excluded_message_ids=excluded_message_ids,
+        )
+        return (
+            messages,
+            config,
+            api_key,
+            [entry.name for entry in worldbook_entries],
+            self._message_signature(assistant_message),
+        )
+
+    async def generate_recommended_reply(self, session_id: str) -> RecommendedReplyOutput:
+        """基于固定快照和最近二十轮生成一条不落库的用户回复建议。"""
+
+        self._get_session_model(session_id)
+        context_snapshot = self._get_context_snapshot(session_id)
+        latest_message = self.session.scalar(
+            select(MessageModel)
+            .where(MessageModel.session_id == session_id)
+            .order_by(MessageModel.position.desc(), MessageModel.id.desc())
+            .limit(1)
+        )
+        if latest_message is None or latest_message.role != "assistant":
+            raise AppError(
+                status_code=409,
+                code="RECOMMENDATION_NOT_AVAILABLE",
+                message="当前需要先完成角色回复",
+            )
+        config, api_key = self._require_main_model_config()
+        history = list(
+            self.session.scalars(
+                select(MessageModel)
+                .where(
+                    MessageModel.session_id == session_id,
+                    MessageModel.role.in_(("user", "assistant")),
+                )
+                .order_by(MessageModel.position.desc(), MessageModel.id.desc())
+                .limit(40)
+            ).all()
+        )
+        history.reverse()
+        messages = self._build_fixed_context_messages(context_snapshot)
+        messages.extend(self._history_message_to_model(message) for message in history)
+        chain = build_recommended_reply_chain(
+            gateway=self.gateway,
+            base_url=config.base_url,
+            model=config.model_name,
+            api_key=api_key,
+        )
+        try:
+            return await chain.ainvoke(messages)
+        except AppError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "用户推荐回复生成失败",
+                extra={
+                    "event": "recommended_reply_failed",
+                    "business_ids": {"sessionId": session_id},
+                },
+            )
+            raise AppError(
+                status_code=502,
+                code="RECOMMENDED_REPLY_FAILED",
+                message="推荐回复生成失败",
+            ) from exc
+
     async def prepare_chat_turn(
         self,
         session_id: str,
         payload: SendMessagePayload,
-    ) -> tuple[list[dict[str, str]], ModelConfig, str, list[str]]:
+    ) -> tuple[list[dict[str, str]], ModelConfig, str, list[str], str]:
         """在建立 SSE 前保存用户原文、执行双 RAG 并返回完整上下文。"""
 
         chat_session = self._get_session_model(session_id)
@@ -252,6 +390,10 @@ class ChatService:
             logger.warning(
                 "Embedding 配置在检索期间发生变化，双 RAG 向量召回已降级 session_id=%s",
                 session_id,
+                extra={
+                    "event": "chat_retrieval_degraded_config_changed",
+                    "business_ids": {"sessionId": session_id},
+                },
             )
             query_embedding = None
         worldbook_entries = self._retrieve_worldbook_context(
@@ -273,7 +415,13 @@ class ChatService:
             worldbook_entries=worldbook_entries,
             memories=memories,
         )
-        return messages, config, api_key, [entry.name for entry in worldbook_entries]
+        return (
+            messages,
+            config,
+            api_key,
+            [entry.name for entry in worldbook_entries],
+            user_message.id,
+        )
 
     async def stream_basic_reply(
         self,
@@ -282,6 +430,7 @@ class ChatService:
         config: ModelConfig,
         api_key: str,
         retrieved_entries: list[str],
+        user_message_id: str,
     ) -> AsyncIterator[dict[str, object]]:
         """发送检索提示，生成并保存角色回复，再产生有序内容块事件。"""
 
@@ -298,6 +447,7 @@ class ChatService:
             output = await chain.ainvoke(messages)
             assistant_message, round_count = self._save_assistant_reply(
                 session_id,
+                user_message_id,
                 output,
                 retrieved_entries,
             )
@@ -307,9 +457,27 @@ class ChatService:
             return
         except Exception:
             self.session.rollback()
-            logger.exception("基础角色回复生成或保存失败 session_id=%s", session_id)
+            logger.exception(
+                "基础角色回复生成或保存失败",
+                extra={
+                    "event": "chat_reply_failed",
+                    "business_ids": {"sessionId": session_id},
+                },
+            )
             yield {"type": "error", "message": "角色回复生成失败"}
             return
+
+        logger.info(
+            "基础角色回复生成完成",
+            extra={
+                "event": "chat_reply_completed",
+                "business_ids": {
+                    "sessionId": session_id,
+                    "messageId": assistant_message.id,
+                    "roundCount": round_count,
+                },
+            },
+        )
 
         for sequence, block in enumerate(assistant_message.blocks):
             yield {
@@ -329,6 +497,69 @@ class ChatService:
             "messageId": assistant_message.id,
             "roundCount": round_count,
         }
+
+    async def stream_message_action(
+        self,
+        session_id: str,
+        assistant_message_id: str,
+        action: str,
+        messages: list[dict[str, str]],
+        config: ModelConfig,
+        api_key: str,
+        retrieved_entries: list[str],
+        expected_signature: str,
+    ) -> AsyncIterator[dict[str, object]]:
+        """生成重说或继续说内容，并覆盖或追加到同一条助手消息。"""
+
+        if retrieved_entries:
+            yield {"type": "retrieval", "entries": retrieved_entries}
+        chain = build_basic_chat_chain(
+            gateway=self.gateway,
+            base_url=config.base_url,
+            model=config.model_name,
+            api_key=api_key,
+        )
+        try:
+            output = await chain.ainvoke(messages)
+            if action == "regenerate":
+                assistant_message, round_count = self._replace_assistant_reply(
+                    session_id,
+                    assistant_message_id,
+                    expected_signature,
+                    output,
+                    retrieved_entries,
+                )
+            elif action == "continue":
+                assistant_message, round_count = self._append_assistant_reply(
+                    session_id,
+                    assistant_message_id,
+                    expected_signature,
+                    output,
+                    retrieved_entries,
+                )
+            else:
+                raise ValueError("不支持的消息操作")
+        except AppError as exc:
+            self.session.rollback()
+            yield {"type": "error", "message": exc.message}
+            return
+        except Exception:
+            self.session.rollback()
+            logger.exception(
+                "助手消息操作生成或保存失败",
+                extra={
+                    "event": "chat_message_action_failed",
+                    "business_ids": {
+                        "sessionId": session_id,
+                        "messageId": assistant_message_id,
+                    },
+                },
+            )
+            yield {"type": "error", "message": "角色回复生成失败"}
+            return
+
+        for event in self._message_stream_events(assistant_message, round_count):
+            yield event
 
     def _get_current_identity(self) -> UserIdentity:
         """读取单用户当前身份，缺失表示数据库初始化状态损坏。"""
@@ -372,6 +603,70 @@ class ChatService:
             )
         return chat_session
 
+    def _get_context_snapshot(self, session_id: str) -> SessionContextSnapshot:
+        """读取会话唯一上下文快照，缺失表示数据库状态损坏。"""
+
+        context_snapshot = self.session.scalar(
+            select(SessionContextSnapshot).where(SessionContextSnapshot.session_id == session_id)
+        )
+        if context_snapshot is None:
+            raise RuntimeError("会话缺少上下文快照")
+        return context_snapshot
+
+    def _get_mutable_last_turn(
+        self,
+        session_id: str,
+        assistant_message_id: str,
+    ) -> tuple[ChatSession, MessageModel, MessageModel]:
+        """校验目标是当前物理末尾的完整助手轮次，并返回成对消息。"""
+
+        chat_session = self._get_session_model(session_id)
+        assistant_message = self.repository.get(MessageModel, assistant_message_id)
+        latest_message_id = self.session.scalar(
+            select(MessageModel.id)
+            .where(MessageModel.session_id == session_id)
+            .order_by(MessageModel.position.desc(), MessageModel.id.desc())
+            .limit(1)
+        )
+        if (
+            assistant_message is None
+            or assistant_message.session_id != session_id
+            or assistant_message.role != "assistant"
+            or assistant_message.turn_number is None
+            or latest_message_id != assistant_message.id
+        ):
+            raise AppError(
+                status_code=409,
+                code="MESSAGE_NOT_MUTABLE",
+                message="只能操作最后一条完整角色回复",
+            )
+
+        unfinished_task = self.session.scalar(
+            select(BackgroundTask.id).where(
+                BackgroundTask.task_type == "memory_consolidation",
+                BackgroundTask.scope_id == session_id,
+                BackgroundTask.target_version == assistant_message.turn_number,
+                BackgroundTask.status.in_(("pending", "running", "failed")),
+            )
+        )
+        if unfinished_task is not None:
+            raise AppError(
+                status_code=409,
+                code="MEMORY_TASK_IN_PROGRESS",
+                message="当前轮次的长期记忆整理尚未完成",
+            )
+
+        user_message = self.session.scalar(
+            select(MessageModel).where(
+                MessageModel.session_id == session_id,
+                MessageModel.turn_number == assistant_message.turn_number,
+                MessageModel.role == "user",
+            )
+        )
+        if user_message is None:
+            raise RuntimeError("完整助手回复缺少配对用户消息")
+        return chat_session, user_message, assistant_message
+
     async def _create_retrieval_embedding(
         self,
         *,
@@ -387,7 +682,13 @@ class ChatService:
             or not config.secret_ref
             or config.vector_dimension is None
         ):
-            logger.warning("Embedding 模型未配置，双 RAG 向量召回已降级 session_id=%s", session_id)
+            logger.warning(
+                "Embedding 模型未配置，双 RAG 向量召回已降级",
+                extra={
+                    "event": "chat_retrieval_degraded_model_unconfigured",
+                    "business_ids": {"sessionId": session_id},
+                },
+            )
             return None
         try:
             api_key = unprotect_api_key(config.secret_ref)
@@ -395,6 +696,10 @@ class ChatService:
             logger.warning(
                 "Embedding 模型密钥不可用，双 RAG 向量召回已降级 session_id=%s",
                 session_id,
+                extra={
+                    "event": "chat_retrieval_degraded_key_unavailable",
+                    "business_ids": {"sessionId": session_id},
+                },
             )
             return None
         try:
@@ -410,6 +715,13 @@ class ChatService:
                 "Embedding 服务失败，双 RAG 向量召回已降级 session_id=%s code=%s",
                 session_id,
                 exc.code,
+                extra={
+                    "event": "chat_retrieval_degraded_embedding_failed",
+                    "business_ids": {
+                        "sessionId": session_id,
+                        "errorCode": exc.code,
+                    },
+                },
             )
             return None
         except Exception as exc:
@@ -417,9 +729,63 @@ class ChatService:
                 "Embedding 服务异常，双 RAG 向量召回已降级 session_id=%s error_type=%s",
                 session_id,
                 type(exc).__name__,
+                extra={
+                    "event": "chat_retrieval_degraded_embedding_error",
+                    "business_ids": {"sessionId": session_id},
+                },
             )
             return None
         return embeddings[0]
+
+    async def _retrieve_reply_context(
+        self,
+        *,
+        chat_session: ChatSession,
+        current_user_message_id: str,
+        current_input: str,
+        embedding_config: ModelConfig,
+    ) -> tuple[list[SessionWorldBookEntrySnapshot], list[LongTermMemory]]:
+        """为已有用户轮次复用双 RAG 检索流程。"""
+
+        embedding_version = embedding_config.config_version
+        retrieval_text = self.build_retrieval_text(
+            session_id=chat_session.id,
+            current_user_message_id=current_user_message_id,
+            current_input=current_input,
+        )
+        query_embedding = await self._create_retrieval_embedding(
+            session_id=chat_session.id,
+            retrieval_text=retrieval_text,
+            config=embedding_config,
+        )
+        self.session.expire_all()
+        current_embedding_config = self._get_embedding_config()
+        if (
+            current_embedding_config.rebuild_required
+            or current_embedding_config.config_version != embedding_version
+        ):
+            logger.warning(
+                "Embedding 配置在检索期间发生变化，双 RAG 向量召回已降级 session_id=%s",
+                chat_session.id,
+                extra={
+                    "event": "chat_retrieval_degraded_config_changed",
+                    "business_ids": {"sessionId": chat_session.id},
+                },
+            )
+            query_embedding = None
+        return (
+            self._retrieve_worldbook_context(
+                chat_session=chat_session,
+                current_input=current_input,
+                query_embedding=query_embedding,
+                embedding_version=embedding_version,
+            ),
+            self._retrieve_memory_context(
+                chat_session=chat_session,
+                query_embedding=query_embedding,
+                embedding_version=embedding_version,
+            ),
+        )
 
     def _retrieve_worldbook_context(
         self,
@@ -444,6 +810,10 @@ class ChatService:
                 "世界书向量检索失败，已降级为常驻和关键词召回 session_id=%s error_type=%s",
                 chat_session.id,
                 type(exc).__name__,
+                extra={
+                    "event": "worldbook_retrieval_degraded",
+                    "business_ids": {"sessionId": chat_session.id},
+                },
             )
             entries = retriever.retrieve(
                 chat_session=chat_session,
@@ -452,7 +822,13 @@ class ChatService:
                 embedding_version=embedding_version,
             )
         if chat_session.world_book_id is not None and not entries:
-            logger.warning("世界书检索为空 session_id=%s", chat_session.id)
+            logger.warning(
+                "世界书检索为空",
+                extra={
+                    "event": "worldbook_retrieval_empty",
+                    "business_ids": {"sessionId": chat_session.id},
+                },
+            )
         return entries
 
     def _retrieve_memory_context(
@@ -475,10 +851,20 @@ class ChatService:
                 "长期记忆检索失败，已降级为空 character_id=%s error_type=%s",
                 chat_session.character_id,
                 type(exc).__name__,
+                extra={
+                    "event": "memory_retrieval_degraded",
+                    "business_ids": {"characterId": chat_session.character_id},
+                },
             )
             memories = []
         if not memories:
-            logger.warning("长期记忆检索为空 character_id=%s", chat_session.character_id)
+            logger.warning(
+                "长期记忆检索为空",
+                extra={
+                    "event": "memory_retrieval_empty",
+                    "business_ids": {"characterId": chat_session.character_id},
+                },
+            )
         return memories
 
     def _copy_enabled_world_book_entries(
@@ -556,34 +942,16 @@ class ChatService:
         context_snapshot: SessionContextSnapshot,
         worldbook_entries: list[SessionWorldBookEntrySnapshot],
         memories: list[LongTermMemory],
+        excluded_message_ids: tuple[str, ...] | None = None,
     ) -> list[dict[str, str]]:
         """按身份、角色、双 RAG、短期历史和当前输入的固定顺序组装上下文。"""
 
-        examples = json.loads(context_snapshot.character_dialogue_examples_json)
-        examples_text = "\n".join(
-            f"用户示例：{example['user']}\n角色示例：{example['assistant']}" for example in examples
+        messages = self._build_fixed_context_messages(context_snapshot)
+        excluded_ids = (
+            (current_user_message_id,)
+            if excluded_message_ids is None
+            else excluded_message_ids
         )
-        messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "用户身份快照：\n"
-                    f"姓名：{context_snapshot.identity_name}\n"
-                    f"身份名称：{context_snapshot.identity_persona_name}\n"
-                    f"用户设定：{context_snapshot.identity_bio}"
-                ),
-            },
-            {
-                "role": "system",
-                "content": (
-                    "角色卡快照：\n"
-                    f"名称：{context_snapshot.character_name}\n"
-                    f"简介：{context_snapshot.character_introduction}\n"
-                    f"角色规则：{context_snapshot.character_system_prompt}\n"
-                    f"对话示例：\n{examples_text or '无'}"
-                ),
-            },
-        ]
 
         if worldbook_entries:
             entries_text = "\n\n".join(
@@ -616,14 +984,16 @@ class ChatService:
                 }
             )
 
+        history_filters = [
+            MessageModel.session_id == session_id,
+            MessageModel.role.in_(("user", "assistant")),
+        ]
+        if excluded_ids:
+            history_filters.append(MessageModel.id.not_in(excluded_ids))
         recent_messages = list(
             self.session.scalars(
                 select(MessageModel)
-                .where(
-                    MessageModel.session_id == session_id,
-                    MessageModel.id != current_user_message_id,
-                    MessageModel.role.in_(("user", "assistant")),
-                )
+                .where(*history_filters)
                 .order_by(MessageModel.position.desc(), MessageModel.id.desc())
                 .limit(40)
             ).all()
@@ -632,6 +1002,38 @@ class ChatService:
         messages.extend(self._history_message_to_model(message) for message in recent_messages)
         messages.append({"role": "user", "content": current_input})
         return messages
+
+    @staticmethod
+    def _build_fixed_context_messages(
+        context_snapshot: SessionContextSnapshot,
+    ) -> list[dict[str, str]]:
+        """构造角色回复和用户推荐共同使用的固定身份、角色快照。"""
+
+        examples = json.loads(context_snapshot.character_dialogue_examples_json)
+        examples_text = "\n".join(
+            f"用户示例：{example['user']}\n角色示例：{example['assistant']}" for example in examples
+        )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "用户身份快照：\n"
+                    f"姓名：{context_snapshot.identity_name}\n"
+                    f"身份名称：{context_snapshot.identity_persona_name}\n"
+                    f"用户设定：{context_snapshot.identity_bio}"
+                ),
+            },
+            {
+                "role": "system",
+                "content": (
+                    "角色卡快照：\n"
+                    f"名称：{context_snapshot.character_name}\n"
+                    f"简介：{context_snapshot.character_introduction}\n"
+                    f"角色规则：{context_snapshot.character_system_prompt}\n"
+                    f"对话示例：\n{examples_text or '无'}"
+                ),
+            },
+        ]
 
     def build_retrieval_text(
         self,
@@ -696,12 +1098,26 @@ class ChatService:
     def _save_assistant_reply(
         self,
         session_id: str,
+        user_message_id: str,
         output: ChatReplyOutput,
         retrieved_entries: list[str],
     ) -> tuple[Message, int]:
         """原子保存完整助手消息、有序块和完成后的会话轮次。"""
 
         chat_session = self._get_session_model(session_id)
+        user_message = self.repository.get(MessageModel, user_message_id)
+        if (
+            user_message is None
+            or user_message.session_id != session_id
+            or user_message.role != "user"
+            or user_message.turn_number is not None
+        ):
+            raise AppError(
+                status_code=409,
+                code="CHAT_TURN_STALE",
+                message="当前用户消息已被处理或不存在",
+            )
+        turn_number = chat_session.round_count + 1
         last_position = self.session.scalar(
             select(func.max(MessageModel.position)).where(MessageModel.session_id == session_id)
         )
@@ -709,6 +1125,7 @@ class ChatService:
             MessageModel(
                 session_id=session_id,
                 position=(last_position if last_position is not None else -1) + 1,
+                turn_number=turn_number,
                 role="assistant",
                 retrieved_entries_json=json.dumps(retrieved_entries, ensure_ascii=False),
             )
@@ -723,11 +1140,146 @@ class ChatService:
                     content=block.content,
                 )
             )
+        user_message.turn_number = turn_number
         chat_session.round_count += 1
         chat_session.updated_at = utc_now()
         self._create_memory_consolidation_task_if_due(chat_session)
         self.session.commit()
         return self._message_to_dto(assistant), chat_session.round_count
+
+    def _replace_assistant_reply(
+        self,
+        session_id: str,
+        assistant_message_id: str,
+        expected_signature: str,
+        output: ChatReplyOutput,
+        retrieved_entries: list[str],
+    ) -> tuple[Message, int]:
+        """生成成功后物理移除旧内容块，并在同一消息上写入新内容。"""
+
+        chat_session, _user_message, assistant = self._get_mutable_last_turn(
+            session_id,
+            assistant_message_id,
+        )
+        if self._message_signature(assistant) != expected_signature:
+            raise AppError(
+                status_code=409,
+                code="MESSAGE_CHANGED",
+                message="角色回复在生成期间发生变化",
+            )
+        old_blocks = self.session.scalars(
+            select(MessageBlockModel).where(MessageBlockModel.message_id == assistant.id)
+        ).all()
+        for block in old_blocks:
+            self.repository.delete(block)
+        self.repository.flush()
+        self._add_reply_blocks(assistant.id, output, start_sequence=0)
+        assistant.retrieved_entries_json = json.dumps(retrieved_entries, ensure_ascii=False)
+        chat_session.updated_at = utc_now()
+        self.session.commit()
+        return self._message_to_dto(assistant), chat_session.round_count
+
+    def _append_assistant_reply(
+        self,
+        session_id: str,
+        assistant_message_id: str,
+        expected_signature: str,
+        output: ChatReplyOutput,
+        retrieved_entries: list[str],
+    ) -> tuple[Message, int]:
+        """把续写块追加到同一助手消息，不创建新消息或新轮次。"""
+
+        chat_session, _user_message, assistant = self._get_mutable_last_turn(
+            session_id,
+            assistant_message_id,
+        )
+        if self._message_signature(assistant) != expected_signature:
+            raise AppError(
+                status_code=409,
+                code="MESSAGE_CHANGED",
+                message="角色回复在生成期间发生变化",
+            )
+        last_sequence = self.session.scalar(
+            select(func.max(MessageBlockModel.sequence)).where(
+                MessageBlockModel.message_id == assistant.id
+            )
+        )
+        self._add_reply_blocks(
+            assistant.id,
+            output,
+            start_sequence=(last_sequence if last_sequence is not None else -1) + 1,
+        )
+        previous_retrieved = (
+            json.loads(assistant.retrieved_entries_json)
+            if assistant.retrieved_entries_json is not None
+            else []
+        )
+        assistant.retrieved_entries_json = json.dumps(
+            list(dict.fromkeys([*previous_retrieved, *retrieved_entries])),
+            ensure_ascii=False,
+        )
+        chat_session.updated_at = utc_now()
+        self.session.commit()
+        return self._message_to_dto(assistant), chat_session.round_count
+
+    def _add_reply_blocks(
+        self,
+        message_id: str,
+        output: ChatReplyOutput,
+        *,
+        start_sequence: int,
+    ) -> None:
+        """从指定序号连续写入结构化助手内容块。"""
+
+        for offset, block in enumerate(output.blocks):
+            self.repository.add(
+                MessageBlockModel(
+                    message_id=message_id,
+                    sequence=start_sequence + offset,
+                    type=block.type,
+                    content=block.content,
+                )
+            )
+
+    def _message_signature(self, message: MessageModel) -> str:
+        """计算消息当前内容签名，用于拒绝异步生成期间的并发覆盖。"""
+
+        blocks = self.session.scalars(
+            select(MessageBlockModel)
+            .where(MessageBlockModel.message_id == message.id)
+            .order_by(MessageBlockModel.sequence, MessageBlockModel.id)
+        ).all()
+        payload = {
+            "retrieved": message.retrieved_entries_json,
+            "blocks": [
+                {"sequence": block.sequence, "type": block.type, "content": block.content}
+                for block in blocks
+            ],
+        }
+        return calculate_content_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+    @staticmethod
+    def _message_stream_events(message: Message, round_count: int) -> list[dict[str, object]]:
+        """把已保存的消息转换为前端复用的 SSE 内容块事件。"""
+
+        events: list[dict[str, object]] = []
+        for sequence, block in enumerate(message.blocks):
+            events.append(
+                {"type": "block_start", "sequence": sequence, "blockType": block.type}
+            )
+            for offset in range(0, len(block.content), 24):
+                events.append(
+                    {
+                        "type": "block_delta",
+                        "sequence": sequence,
+                        "text": block.content[offset : offset + 24],
+                    }
+                )
+            events.append({"type": "block_end", "sequence": sequence})
+        events.append(
+            {"type": "done", "messageId": message.id, "roundCount": round_count}
+        )
+        return events
 
     def _create_memory_consolidation_task_if_due(self, chat_session: ChatSession) -> None:
         """在新的完整十轮边界创建唯一待处理任务，并与助手回复一同提交。"""
@@ -914,13 +1466,20 @@ class ChatService:
                 ids=[session_entry_document_id(snapshot_id) for snapshot_id in snapshot_ids]
             )
         except Exception:
-            logger.warning("会话世界书快照向量清理失败，已记录补偿任务", exc_info=True)
+            logger.warning(
+                "会话世界书快照向量清理失败，已记录补偿任务",
+                exc_info=True,
+                extra={
+                    "event": "session_snapshot_cleanup_deferred",
+                    "business_ids": {"count": len(snapshot_ids)},
+                },
+            )
             for snapshot_id in snapshot_ids:
                 self.repository.add(
                     BackgroundTask(
                         task_type="vector_cleanup",
                         status="pending",
-                        scope_id=snapshot_id,
+                        scope_id=session_entry_document_id(snapshot_id),
                         progress_current=0,
                         progress_total=1,
                         error_message="会话世界书快照向量待清理",
@@ -931,19 +1490,23 @@ class ChatService:
     def _session_to_dto(self, chat_session: ChatSession) -> Session:
         """将会话与其唯一上下文快照转换为公开 DTO。"""
 
-        context_snapshot_id = self.session.scalar(
-            select(SessionContextSnapshot.id).where(
+        context_snapshot = self.session.scalar(
+            select(SessionContextSnapshot).where(
                 SessionContextSnapshot.session_id == chat_session.id
             )
         )
-        if context_snapshot_id is None:
+        if context_snapshot is None:
             raise RuntimeError("会话缺少上下文快照")
         return Session(
             id=chat_session.id,
             title=chat_session.title,
             character_id=chat_session.character_id,
             world_book_id=chat_session.world_book_id,
-            identity_snapshot_id=context_snapshot_id,
+            identity_snapshot_id=context_snapshot.id,
+            identity_name=context_snapshot.identity_name,
+            identity_persona_name=context_snapshot.identity_persona_name,
+            character_name=context_snapshot.character_name,
+            world_book_name=context_snapshot.world_book_name,
             round_count=chat_session.round_count,
             consolidated_round=chat_session.consolidated_round,
             summary=chat_session.summary,

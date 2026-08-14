@@ -669,7 +669,7 @@ def test_delete_world_book_records_cleanup_tasks_when_chroma_fails(
             ).all()
         )
         assert [task.scope_id for task in tasks] == sorted(
-            entry.id for entry in entries
+            worldbook_entry_document_id(entry.id) for entry in entries
         )
         assert all(task.status == "pending" for task in tasks)
         assert all(task.progress_total == 1 for task in tasks)

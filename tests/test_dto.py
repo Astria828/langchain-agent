@@ -5,6 +5,7 @@ from app.schemas.dto import (
     ChatReplyOutput,
     ConfirmWorldBookDraftsPayload,
     DataResponse,
+    LogEntry,
     SendMessagePayload,
     Session,
     UpdateCharacterPayload,
@@ -173,6 +174,10 @@ def test_session_rejects_consolidated_round_ahead_of_round_count() -> None:
                 "characterId": "character-1",
                 "worldBookId": None,
                 "identitySnapshotId": "snapshot-1",
+                "identityName": "林舟",
+                "identityPersonaName": "旅人",
+                "characterName": "归舟",
+                "worldBookName": None,
                 "roundCount": 9,
                 "consolidatedRound": 10,
                 "summary": "",
@@ -180,6 +185,25 @@ def test_session_rejects_consolidated_round_ahead_of_round_count() -> None:
                 "updatedAt": "2026-08-09T00:00:00Z",
             }
         )
+
+
+def test_log_entry_requires_stable_event_name() -> None:
+    """日志 DTO 对外输出阶段 8 约定的事件名和 requestId。"""
+
+    entry = LogEntry.model_validate(
+        {
+            "id": "log-1",
+            "date": "2026-08-11",
+            "time": "18:30:00",
+            "level": "INFO",
+            "module": "session",
+            "event": "session_created",
+            "requestId": "req-1",
+            "message": "会话已创建",
+        }
+    )
+
+    assert entry.model_dump(by_alias=True)["event"] == "session_created"
 
 
 def test_chat_payloads_require_non_blank_text_and_ordered_blocks() -> None:

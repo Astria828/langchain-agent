@@ -58,6 +58,12 @@ class Settings(BaseSettings):
         return self.resolved_data_dir / "logs"
 
     @property
+    def exports_dir(self) -> Path:
+        """返回有时效的临时业务导出目录。"""
+
+        return self.resolved_data_dir / "exports"
+
+    @property
     def database_url(self) -> str:
         """生成 SQLAlchemy 使用的 SQLite URL。"""
 

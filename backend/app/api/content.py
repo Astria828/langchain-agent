@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.api.system import get_chroma_repository, get_model_gateway
@@ -25,6 +25,7 @@ from app.schemas.dto import (
 )
 from app.services.content_service import ContentService
 from app.services.worldbook_service import WorldBookService
+from app.tasks.vector_cleanup_task import run_pending_vector_cleanup_tasks
 
 router = APIRouter(prefix="/api", tags=["content"])
 
@@ -198,11 +199,18 @@ def update_world_book(
 )
 def delete_world_book(
     world_book_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
     service: Annotated[WorldBookService, Depends(get_worldbook_service)],
 ) -> Response:
     """删除未被历史会话引用的世界书并清理向量。"""
 
     service.delete_world_book(world_book_id)
+    background_tasks.add_task(
+        run_pending_vector_cleanup_tasks,
+        request.app.state.settings,
+        service.chroma,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -287,11 +295,18 @@ def update_world_book_entry(
 def delete_world_book_entry(
     world_book_id: str,
     entry_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
     service: Annotated[WorldBookService, Depends(get_worldbook_service)],
 ) -> Response:
     """删除正式条目并清理对应向量。"""
 
     service.delete_entry(world_book_id, entry_id)
+    background_tasks.add_task(
+        run_pending_vector_cleanup_tasks,
+        request.app.state.settings,
+        service.chroma,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

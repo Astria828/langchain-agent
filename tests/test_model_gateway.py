@@ -195,6 +195,32 @@ def test_transient_upstream_status_is_retried_once() -> None:
     assert attempts == 2
 
 
+def test_timeout_is_retried_once_and_returns_stable_error() -> None:
+    """连续超时只重试一次，并转换为不含请求细节的稳定 504 错误。"""
+
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("upstream timeout with secret", request=request)
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+    with pytest.raises(AppError) as error:
+        asyncio.run(
+            gateway.test_main(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-timeout-secret",
+            )
+        )
+
+    assert attempts == 2
+    assert error.value.status_code == 504
+    assert error.value.code == "MODEL_CONNECTION_TIMEOUT"
+    assert "secret" not in error.value.message
+
+
 def test_upstream_error_does_not_expose_response_or_key() -> None:
     """服务商响应正文和 API Key 不进入业务错误。"""
 

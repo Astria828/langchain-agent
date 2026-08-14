@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 
+import ConfirmInline from '@/components/ConfirmInline';
 import FilterChips from '@/components/FilterChips';
 import PageHeader from '@/components/PageHeader';
 import { client } from '@/services/api';
@@ -30,6 +31,8 @@ const RANGES: Array<{ id: LogRange; label: string }> = [
 
 export default function LogsPage() {
   const logs = useAppStore((s) => s.logs);
+  const logsLoading = useAppStore((s) => s.logsLoading);
+  const logsError = useAppStore((s) => s.logsError);
   const logLevel = useAppStore((s) => s.logLevel);
   const logRange = useAppStore((s) => s.logRange);
   const setLogLevel = useAppStore((s) => s.setLogLevel);
@@ -37,6 +40,7 @@ export default function LogsPage() {
   const refreshLogs = useAppStore((s) => s.refreshLogs);
   const clearLogs = useAppStore((s) => s.clearLogs);
   const flash = useAppStore((s) => s.flash);
+  const [pendingDelete, setPendingDelete] = useState(false);
 
   useEffect(() => {
     void refreshLogs();
@@ -66,7 +70,7 @@ export default function LogsPage() {
     try {
       saveBlob(
         await client.downloadLogs({ level: logLevel, range: logRange }),
-        `loreweave-logs-${logRange}-${logLevel}.json`,
+        `loreweave-logs-${logRange}-${logLevel}.log`,
       );
       flash(`已下载筛选结果 · ${logs.length} 条日志（不含密钥与对话正文）`);
     } catch {
@@ -91,7 +95,7 @@ export default function LogsPage() {
               </button>
               <button
                 className="btn-dim-danger"
-                onClick={() => void clearLogs()}
+                onClick={() => setPendingDelete(true)}
                 style={{ fontSize: 12.5, padding: '8px 16px' }}
               >
                 删除筛选结果
@@ -99,6 +103,19 @@ export default function LogsPage() {
             </div>
           }
         />
+
+        {pendingDelete && (
+          <ConfirmInline
+            text={`确定删除当前筛选条件下的 ${logs.length} 条日志？此操作不可恢复。`}
+            layout="inline"
+            onConfirm={() => {
+              setPendingDelete(false);
+              void clearLogs();
+            }}
+            onCancel={() => setPendingDelete(false)}
+            style={{ marginTop: 20 }}
+          />
+        )}
 
         <FilterChips
           size="sm"
@@ -124,6 +141,20 @@ export default function LogsPage() {
         <div style={{ fontSize: 11.5, color: 'var(--text-dim-4)', marginBottom: 12 }}>
           共 {logs.length} 条 · 滚动文件保存，可按当前筛选下载或删除
         </div>
+
+        {logsError && (
+          <div className="note-warn" style={{ marginBottom: 12 }}>
+            日志加载失败：{logsError}
+            <button
+              className="btn-ghost"
+              onClick={() => void refreshLogs()}
+              disabled={logsLoading}
+              style={{ marginLeft: 12, fontSize: 12 }}
+            >
+              重试
+            </button>
+          </div>
+        )}
 
         <div
           style={{
@@ -182,7 +213,21 @@ export default function LogsPage() {
             </div>
           ))}
 
-          {logs.length === 0 && (
+          {logsLoading && logs.length === 0 && (
+            <div
+              style={{
+                padding: 40,
+                textAlign: 'center',
+                fontSize: 13,
+                color: 'var(--text-dim-4)',
+                fontFamily: 'var(--font-sans)',
+              }}
+            >
+              正在读取日志…
+            </div>
+          )}
+
+          {!logsLoading && !logsError && logs.length === 0 && (
             <div
               style={{
                 padding: 40,

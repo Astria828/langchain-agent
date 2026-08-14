@@ -99,9 +99,7 @@ class MemoryService:
         if memory_type is not None:
             statement = statement.where(LongTermMemory.type == memory_type)
         if status is not None:
-            statement = statement.where(
-                LongTermMemory.status == MEMORY_STATUS_TO_DATABASE[status]
-            )
+            statement = statement.where(LongTermMemory.status == MEMORY_STATUS_TO_DATABASE[status])
         memories = self.session.scalars(
             statement.order_by(LongTermMemory.created_at.desc(), LongTermMemory.id.desc())
         ).all()
@@ -299,9 +297,7 @@ class MemoryService:
         batch_memories = self._load_batch_memories(source_ids)
         current_embedding_config = self.repository.get(ModelConfig, "embed")
         current_embedding_version = (
-            current_embedding_config.config_version
-            if current_embedding_config is not None
-            else 0
+            current_embedding_config.config_version if current_embedding_config is not None else 0
         )
         active_to_sync = [
             memory
@@ -529,9 +525,7 @@ class MemoryService:
         """按候选来源顺序追加尚未存在的消息关系。"""
 
         last_order = self.session.scalar(
-            select(func.max(MemorySource.source_order)).where(
-                MemorySource.memory_id == memory_id
-            )
+            select(func.max(MemorySource.source_order)).where(MemorySource.memory_id == memory_id)
         )
         next_order = (last_order if last_order is not None else -1) + 1
         for message_id in source_message_ids:
@@ -622,10 +616,11 @@ class MemoryService:
         """为删除失败的确定记忆 ID 创建不重复的向量清理补偿任务。"""
 
         for memory in memories:
+            document_id = memory_document_id(memory.id)
             existing_task_id = self.session.scalar(
                 select(BackgroundTask.id).where(
                     BackgroundTask.task_type == "vector_cleanup",
-                    BackgroundTask.scope_id == memory.id,
+                    BackgroundTask.scope_id.in_((memory.id, document_id)),
                     BackgroundTask.status.in_(("pending", "running")),
                 )
             )
@@ -635,7 +630,7 @@ class MemoryService:
                 BackgroundTask(
                     task_type="vector_cleanup",
                     status="pending",
-                    scope_id=memory.id,
+                    scope_id=document_id,
                     progress_current=0,
                     progress_total=1,
                     error_message="长期记忆向量待清理",
@@ -646,13 +641,14 @@ class MemoryService:
     def _finish_memory_cleanup_tasks(self, memories: list[LongTermMemory]) -> None:
         """确定向量已删除后关闭对应的活动补偿任务。"""
 
-        memory_ids = [memory.id for memory in memories]
-        if not memory_ids:
+        document_ids = [memory_document_id(memory.id) for memory in memories]
+        legacy_memory_ids = [memory.id for memory in memories]
+        if not document_ids:
             return
         cleanup_tasks = self.session.scalars(
             select(BackgroundTask).where(
                 BackgroundTask.task_type == "vector_cleanup",
-                BackgroundTask.scope_id.in_(memory_ids),
+                BackgroundTask.scope_id.in_((*document_ids, *legacy_memory_ids)),
                 BackgroundTask.status.in_(("pending", "running")),
             )
         ).all()
@@ -664,43 +660,46 @@ class MemoryService:
             cleanup_task.finished_at = finished_at
 
     def _load_rounds(self, chat_session: ChatSession, target_round: int) -> list[MemoryRound]:
-        """按消息稳定位置组对，并截取目标绝对轮次对应的十轮。"""
+        """按不可变轮次编号读取目标区间，不受已整理历史删除影响。"""
 
+        first_absolute_round = target_round - MEMORY_BATCH_SIZE + 1
         messages = self.session.scalars(
             select(Message)
             .where(
                 Message.session_id == chat_session.id,
                 Message.role.in_(("user", "assistant")),
+                Message.turn_number.between(first_absolute_round, target_round),
             )
-            .order_by(Message.position, Message.id)
+            .order_by(Message.turn_number, Message.position, Message.id)
         ).all()
-        complete_rounds: list[tuple[Message, Message]] = []
-        pending_user: Message | None = None
+        messages_by_turn: dict[int, dict[str, Message]] = {}
         for message in messages:
-            if message.role == "user":
-                pending_user = message
+            if message.turn_number is None:
                 continue
-            if pending_user is not None:
-                complete_rounds.append((pending_user, message))
-                pending_user = None
+            messages_by_turn.setdefault(message.turn_number, {})[message.role] = message
 
-        if len(complete_rounds) < target_round:
-            raise self._invalid_task_error("会话完整消息轮次少于整理任务目标轮次")
-        selected = complete_rounds[target_round - MEMORY_BATCH_SIZE : target_round]
-        if len(selected) != MEMORY_BATCH_SIZE:
-            raise self._invalid_task_error("无法读取完整的十轮长期记忆整理区间")
+        selected: list[tuple[int, Message, Message]] = []
+        for absolute_round in range(first_absolute_round, target_round + 1):
+            pair = messages_by_turn.get(absolute_round, {})
+            user_message = pair.get("user")
+            assistant_message = pair.get("assistant")
+            if user_message is None or assistant_message is None:
+                raise self._invalid_task_error("会话完整消息轮次缺少目标整理区间")
+            selected.append((absolute_round, user_message, assistant_message))
 
-        first_absolute_round = target_round - MEMORY_BATCH_SIZE + 1
         return [
             MemoryRound(
                 batch_round=batch_round,
-                absolute_round=first_absolute_round + batch_round - 1,
+                absolute_round=absolute_round,
                 user_message_id=user_message.id,
                 assistant_message_id=assistant_message.id,
                 user_content=self._render_message(user_message),
                 assistant_content=self._render_message(assistant_message),
             )
-            for batch_round, (user_message, assistant_message) in enumerate(selected, start=1)
+            for batch_round, (absolute_round, user_message, assistant_message) in enumerate(
+                selected,
+                start=1,
+            )
         ]
 
     def _render_message(self, message: Message) -> str:
@@ -718,8 +717,7 @@ class MemoryService:
                 raise self._invalid_task_error("长期记忆来源中的用户消息格式无效")
             return blocks[0].content
         return "\n".join(
-            f"[{'动作' if block.type == 'action' else '台词'}] {block.content}"
-            for block in blocks
+            f"[{'动作' if block.type == 'action' else '台词'}] {block.content}" for block in blocks
         )
 
     def _require_main_model_config(self) -> tuple[ModelConfig, str]:
@@ -840,8 +838,7 @@ class MemoryService:
         """拒绝提取结果内部的完全重复候选，避免后续产生两次新增。"""
 
         keys = [
-            (candidate.type, calculate_content_hash(candidate.content))
-            for candidate in candidates
+            (candidate.type, calculate_content_hash(candidate.content)) for candidate in candidates
         ]
         if len(keys) != len(set(keys)):
             raise AppError(
@@ -906,9 +903,7 @@ class MemoryService:
         source_ids: list[str] = []
         for source_round in candidate.source_rounds:
             memory_round = round_by_number[source_round]
-            source_ids.extend(
-                (memory_round.user_message_id, memory_round.assistant_message_id)
-            )
+            source_ids.extend((memory_round.user_message_id, memory_round.assistant_message_id))
         return tuple(source_ids)
 
     @staticmethod

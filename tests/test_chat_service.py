@@ -252,6 +252,10 @@ def test_create_session_freezes_context_and_indexes_only_enabled_entries(
 
         assert created.character_id == character.id
         assert created.world_book_id == book.id
+        assert created.identity_name == "Strand"
+        assert created.identity_persona_name == "master"
+        assert created.character_name == "艾拉"
+        assert created.world_book_name == "魔法人偶"
         assert created.round_count == 0
         context = session.scalar(
             select(SessionContextSnapshot).where(
@@ -298,6 +302,11 @@ def test_create_session_freezes_context_and_indexes_only_enabled_entries(
         assert context.character_name == "艾拉"
         assert context.world_book_name == "魔法人偶"
         assert snapshots[0].content == "银港的事实。"
+        archived = service.list_sessions()[0]
+        assert archived.identity_name == "Strand"
+        assert archived.identity_persona_name == "master"
+        assert archived.character_name == "艾拉"
+        assert archived.world_book_name == "魔法人偶"
     finally:
         session.close()
         engine.dispose()
@@ -431,9 +440,11 @@ def collect_basic_reply_events(
     """准备一轮用户消息并收集全部基础 SSE 业务事件。"""
 
     async def collect() -> list[dict[str, object]]:
-        messages, config, api_key, retrieved_entries = await service.prepare_chat_turn(
-            session_id,
-            SendMessagePayload(content=content),
+        messages, config, api_key, retrieved_entries, user_message_id = (
+            await service.prepare_chat_turn(
+                session_id,
+                SendMessagePayload(content=content),
+            )
         )
         return [
             event
@@ -443,6 +454,7 @@ def collect_basic_reply_events(
                 config,
                 api_key,
                 retrieved_entries,
+                user_message_id,
             )
         ]
 
@@ -498,6 +510,13 @@ def test_basic_chat_turn_saves_user_then_atomic_assistant_blocks(
         assert messages[1].blocks[0].content == "我推开门。"
         assert [block.type for block in messages[2].blocks] == ["action", "dialogue"]
         assert service.list_sessions()[0].round_count == 1
+        stored_turn_messages = session.scalars(
+            select(Message).where(
+                Message.session_id == created.id,
+                Message.turn_number == 1,
+            )
+        ).all()
+        assert {message.role for message in stored_turn_messages} == {"user", "assistant"}
 
         request_messages = gateway.chat_requests[0]
         assert "基础角色对话规则" in request_messages[0]["content"]
@@ -573,7 +592,9 @@ def test_tenth_round_creates_one_pending_memory_task_in_reply_transaction(
         engine.dispose()
 
 
-def test_memory_task_trigger_is_idempotent_for_same_target_round(tmp_path: Path) -> None:
+def test_memory_task_trigger_is_idempotent_for_same_target_round(
+    tmp_path: Path,
+) -> None:
     """同一会话和目标轮次已有任务时，第十轮回复不会插入重复记录。"""
 
     service, session, engine, _chroma = create_service(tmp_path)
@@ -659,10 +680,7 @@ def test_ten_rounds_consolidate_and_recall_only_in_same_character_session(
                     f'"content":"{memory_content}",'
                     '"importance":5,"sourceRounds":[1,10]}]}'
                 ),
-                (
-                    '{"action":"create",'
-                    f'"content":"{memory_content}","importance":5}}'
-                ),
+                (f'{{"action":"create","content":"{memory_content}","importance":5}}'),
             ]
         )
 
@@ -679,16 +697,18 @@ def test_ten_rounds_consolidate_and_recall_only_in_same_character_session(
         chroma.memory_result = {
             "ids": [[memory_document_id(memory.id)]],
             "distances": [[0.10]],
-            "metadatas": [[
-                {
-                    "memoryId": memory.id,
-                    "characterId": character.id,
-                    "status": "active",
-                    "memoryType": memory.type,
-                    "embeddingVersion": 2,
-                    "contentHash": memory.content_hash,
-                }
-            ]],
+            "metadatas": [
+                [
+                    {
+                        "memoryId": memory.id,
+                        "characterId": character.id,
+                        "status": "active",
+                        "memoryType": memory.type,
+                        "embeddingVersion": 2,
+                        "contentHash": memory.content_hash,
+                    }
+                ]
+            ],
         }
         same_character_session = asyncio.run(
             service.create_session(
@@ -698,7 +718,9 @@ def test_ten_rounds_consolidate_and_recall_only_in_same_character_session(
         other_character = add_character(session, name="诺亚")
         other_character_session = asyncio.run(
             service.create_session(
-                CreateSessionPayload(character_id=other_character.id, world_book_id=None)
+                CreateSessionPayload(
+                    character_id=other_character.id, world_book_id=None
+                )
             )
         )
 
@@ -728,7 +750,9 @@ def test_ten_rounds_consolidate_and_recall_only_in_same_character_session(
         engine.dispose()
 
 
-def test_memory_task_failure_rolls_back_assistant_reply_and_round(tmp_path: Path) -> None:
+def test_memory_task_failure_rolls_back_assistant_reply_and_round(
+    tmp_path: Path,
+) -> None:
     """任务记录无法写入时不保留半条助手回复，也不推进第十轮。"""
 
     service, session, engine, _chroma = create_service(tmp_path)
@@ -763,7 +787,9 @@ def test_memory_task_failure_rolls_back_assistant_reply_and_round(tmp_path: Path
         assert refreshed.round_count == 9
         assert session.scalar(select(func.count(BackgroundTask.id))) == 0
         roles = session.scalars(
-            select(Message.role).where(Message.session_id == created.id).order_by(Message.position)
+            select(Message.role)
+            .where(Message.session_id == created.id)
+            .order_by(Message.position)
         ).all()
         assert roles == ["assistant", "user"]
     finally:
@@ -820,16 +846,18 @@ def test_chat_turn_injects_dual_rag_and_persists_worldbook_retrieval(
         chroma.memory_result = {
             "ids": [[memory_document_id(memory.id)]],
             "distances": [[0.10]],
-            "metadatas": [[
-                {
-                    "memoryId": memory.id,
-                    "characterId": character.id,
-                    "status": "active",
-                    "memoryType": memory.type,
-                    "embeddingVersion": 2,
-                    "contentHash": memory.content_hash,
-                }
-            ]],
+            "metadatas": [
+                [
+                    {
+                        "memoryId": memory.id,
+                        "characterId": character.id,
+                        "status": "active",
+                        "memoryType": memory.type,
+                        "embeddingVersion": 2,
+                        "contentHash": memory.content_hash,
+                    }
+                ]
+            ],
         }
 
         events = collect_basic_reply_events(service, created.id, "带我去银港拍照。")
@@ -896,7 +924,9 @@ def test_embedding_failure_degrades_to_non_vector_worldbook_retrieval(
         assert events[0] == {"type": "retrieval", "entries": ["银港"]}
         assert events[-1]["type"] == "done"
         assert chroma.worldbook_queries == []
-        assert any("Embedding 服务失败" in call.args[0] for call in warning.call_args_list)
+        assert any(
+            "Embedding 服务失败" in call.args[0] for call in warning.call_args_list
+        )
         assert service.list_messages(created.id)[-1].retrieved == ["银港"]
     finally:
         session.close()
@@ -942,7 +972,9 @@ def test_unconfigured_embedding_degrades_to_non_vector_worldbook_retrieval(
         assert len(gateway.embedding_requests) == initial_embedding_request_count
         assert chroma.worldbook_queries == []
         assert chroma.memory_queries == []
-        assert any("Embedding 模型未配置" in call.args[0] for call in warning.call_args_list)
+        assert any(
+            "Embedding 模型未配置" in call.args[0] for call in warning.call_args_list
+        )
     finally:
         session.close()
         engine.dispose()
@@ -977,7 +1009,9 @@ def test_chroma_failure_degrades_to_non_vector_worldbook_retrieval(
         assert events[0] == {"type": "retrieval", "entries": ["银港"]}
         assert events[-1]["type"] == "done"
         assert len(chroma.worldbook_queries) == 1
-        assert any("世界书向量检索失败" in call.args[0] for call in warning.call_args_list)
+        assert any(
+            "世界书向量检索失败" in call.args[0] for call in warning.call_args_list
+        )
     finally:
         session.close()
         engine.dispose()
@@ -1019,7 +1053,9 @@ def test_empty_dual_rag_continues_without_retrieval_event_or_prompt_context(
         assert len(chroma.worldbook_queries) == 1
         assert chroma.memory_queries == []
         assert any("世界书检索为空" in call.args[0] for call in warning.call_args_list)
-        assert any("长期记忆检索为空" in call.args[0] for call in warning.call_args_list)
+        assert any(
+            "长期记忆检索为空" in call.args[0] for call in warning.call_args_list
+        )
         assert not any(
             message["content"].startswith(("世界书检索结果：", "长期记忆检索结果："))
             for message in gateway.chat_requests[-1][1:]
@@ -1069,12 +1105,16 @@ def test_memory_chroma_failure_degrades_to_empty_context(
         chroma.memory_error = RuntimeError("Chroma 暂不可用")
 
         with patch("app.services.chat_service.logger.warning") as warning:
-            events = collect_basic_reply_events(service, created.id, "我们是不是有过约定？")
+            events = collect_basic_reply_events(
+                service, created.id, "我们是不是有过约定？"
+            )
 
         assert events[0]["type"] == "block_start"
         assert events[-1]["type"] == "done"
         assert len(chroma.memory_queries) == 1
-        assert any("长期记忆检索失败" in call.args[0] for call in warning.call_args_list)
+        assert any(
+            "长期记忆检索失败" in call.args[0] for call in warning.call_args_list
+        )
         assert not any(
             message["content"].startswith("长期记忆检索结果：")
             for message in gateway.chat_requests[-1][1:]
@@ -1221,6 +1261,143 @@ def test_unconfigured_main_model_rejects_before_saving_user_message(
         assert [message.role for message in service.list_messages(created.id)] == [
             "assistant"
         ]
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_last_reply_can_regenerate_continue_and_delete_in_place(tmp_path: Path) -> None:
+    """最后一条助手回复可原位覆盖、追加，并最终物理删除整轮。"""
+
+    gateway = StubGateway()
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+        collect_basic_reply_events(service, created.id, "我们出发吧。")
+        assistant_id = service.list_messages(created.id)[-1].id
+
+        async def run_action(action: str) -> list[dict[str, object]]:
+            messages, config, api_key, retrieved, signature = (
+                await service.prepare_message_action(created.id, assistant_id, action)
+            )
+            return [
+                event
+                async for event in service.stream_message_action(
+                    created.id,
+                    assistant_id,
+                    action,
+                    messages,
+                    config,
+                    api_key,
+                    retrieved,
+                    signature,
+                )
+            ]
+
+        gateway.chat_response = (
+            '{"blocks":['
+            '{"type":"action","content":"她推开门。"},'
+            '{"type":"dialogue","content":"走吧。"}'
+            "]}"
+        )
+        regenerate_events = asyncio.run(run_action("regenerate"))
+        regenerated = service.list_messages(created.id)[-1]
+        assert regenerate_events[-1]["messageId"] == assistant_id
+        assert regenerated.id == assistant_id
+        assert [block.content for block in regenerated.blocks] == ["她推开门。", "走吧。"]
+        assert service.list_sessions()[0].round_count == 1
+
+        gateway.chat_response = '{"blocks":[{"type":"dialogue","content":"别落下。"}]}'
+        continue_events = asyncio.run(run_action("continue"))
+        continued = service.list_messages(created.id)[-1]
+        assert continue_events[-1]["messageId"] == assistant_id
+        assert [block.sequence for block in continued.blocks] == [0, 1, 2]
+        assert continued.blocks[-1].content == "别落下。"
+        assert gateway.chat_requests[-1][-1]["content"] == (
+            "继续上一条角色回复，从结束处自然续写。"
+            "不要重复已有内容，也不要假设用户产生了新的动作或台词。"
+        )
+
+        service.delete_turn(created.id, assistant_id)
+        assert [message.role for message in service.list_messages(created.id)] == ["assistant"]
+        assert service.list_sessions()[0].round_count == 0
+        assert session.scalar(
+            select(func.count(Message.id)).where(Message.id == assistant_id)
+        ) == 0
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_deleting_consolidated_last_turn_keeps_progress_and_next_number(tmp_path: Path) -> None:
+    """已整理最后一轮物理删除后保留进度，下一轮使用新的稳定编号。"""
+
+    service, session, engine, _chroma = create_service(tmp_path)
+    try:
+        configure_main_model(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+        collect_basic_reply_events(service, created.id, "第十轮内容")
+        turn_messages = session.scalars(
+            select(Message).where(Message.turn_number == 1)
+        ).all()
+        for message in turn_messages:
+            message.turn_number = 10
+        chat_session = session.get(ChatSession, created.id)
+        assert chat_session is not None
+        chat_session.round_count = 10
+        chat_session.consolidated_round = 10
+        session.commit()
+        assistant_id = next(message.id for message in turn_messages if message.role == "assistant")
+
+        service.delete_turn(created.id, assistant_id)
+        session.refresh(chat_session)
+        assert chat_session.round_count == 10
+        assert chat_session.consolidated_round == 10
+
+        collect_basic_reply_events(service, created.id, "新的后续内容")
+        new_turn_numbers = session.scalars(
+            select(Message.turn_number)
+            .where(Message.session_id == created.id, Message.turn_number.is_not(None))
+            .distinct()
+        ).all()
+        assert new_turn_numbers == [11]
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_recommended_reply_uses_history_without_writing_message(tmp_path: Path) -> None:
+    """推荐回复读取当前会话，但只返回草稿内容且不写入数据库。"""
+
+    gateway = StubGateway(chat_response='{"content":"我们去看看吧。"}')
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+        before_count = session.scalar(select(func.count(Message.id)))
+
+        result = asyncio.run(service.generate_recommended_reply(created.id))
+
+        assert result.content == "我们去看看吧。"
+        assert session.scalar(select(func.count(Message.id))) == before_count
+        assert "用户推荐回复规则" in gateway.chat_requests[-1][0]["content"]
+        assert gateway.chat_requests[-1][-1]["content"] == "[台词] 你终于来了。"
     finally:
         session.close()
         engine.dispose()

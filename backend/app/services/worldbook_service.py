@@ -519,7 +519,7 @@ class WorldBookService:
                     BackgroundTask(
                         task_type="vector_cleanup",
                         status="pending",
-                        scope_id=entry_id,
+                        scope_id=worldbook_entry_document_id(entry_id),
                         progress_current=0,
                         progress_total=1,
                         error_message="世界书向量待清理",

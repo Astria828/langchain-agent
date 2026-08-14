@@ -117,6 +117,57 @@ def test_initial_migration_can_downgrade_to_base(tmp_path: Path) -> None:
     engine.dispose()
 
 
+def test_turn_number_migration_backfills_only_complete_rounds(tmp_path: Path) -> None:
+    """历史开场白和孤立用户消息不编号，完整用户—助手轮次共享编号。"""
+
+    settings = isolated_settings(tmp_path)
+    config = build_alembic_config(settings)
+    command.upgrade(config, "ba3fc7114bef")
+    engine = create_database_engine(settings)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO characters "
+                "(id, name, introduction, system_prompt, dialogue_examples_json, "
+                "created_at, updated_at) VALUES "
+                "('character-1', '艾拉', '', '', '[]', 'now', 'now')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions "
+                "(id, title, character_id, round_count, consolidated_round, summary, "
+                "created_at, updated_at) VALUES "
+                "('session-1', '测试', 'character-1', 1, 0, '', 'now', 'now')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO messages "
+                "(id, session_id, position, role, retrieved_entries_json, created_at) VALUES "
+                "('opening', 'session-1', 0, 'assistant', '[]', 'now'), "
+                "('user-1', 'session-1', 1, 'user', NULL, 'now'), "
+                "('assistant-1', 'session-1', 2, 'assistant', '[]', 'now'), "
+                "('orphan-user', 'session-1', 3, 'user', NULL, 'now')"
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_database_engine(settings)
+    with engine.connect() as connection:
+        assigned = connection.execute(
+            text("SELECT id, turn_number FROM messages ORDER BY position")
+        ).all()
+        assert assigned == [
+            ("opening", None),
+            ("user-1", 1),
+            ("assistant-1", 1),
+            ("orphan-user", None),
+        ]
+    engine.dispose()
+
+
 def test_foreign_keys_and_check_constraints_are_enforced(tmp_path: Path) -> None:
     """引用边界与轮次约束由 SQLite 本身兜底。"""
 

@@ -1,9 +1,12 @@
-"""模型配置与只读索引状态接口。"""
+"""模型配置、索引状态、日志管理与业务导出接口。"""
 
-from typing import Annotated
+from datetime import datetime
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask as ResponseBackgroundTask
 
 from app.db.database import get_db_session
 from app.gateways.model_gateway import ModelGateway
@@ -11,7 +14,11 @@ from app.repositories.chroma_repository import ChromaRepository
 from app.schemas.dto import (
     ConnectionTestResult,
     DataResponse,
+    DeleteLogsResult,
     IndexStatus,
+    LogEntry,
+    LogLevel,
+    LogRange,
     ModelEndpointPayload,
     ModelGroup,
     ModelSettings,
@@ -20,6 +27,7 @@ from app.services.system_service import SystemService
 from app.tasks.rebuild_index_task import RebuildIndexTask
 
 router = APIRouter(prefix="/api", tags=["system"])
+LogLevelFilter = LogLevel | Literal["all"]
 
 
 def get_model_gateway() -> ModelGateway:
@@ -35,12 +43,99 @@ def get_chroma_repository(request: Request) -> ChromaRepository:
 
 
 def get_system_service(
+    request: Request,
     session: Annotated[Session, Depends(get_db_session)],
     gateway: Annotated[ModelGateway, Depends(get_model_gateway)],
 ) -> SystemService:
     """为单次请求组装事务 Session 与模型网关。"""
 
-    return SystemService(session, gateway)
+    return SystemService(session, gateway, request.app.state.settings)
+
+
+@router.get("/export/sessions/{session_id}")
+def export_session(
+    session_id: str,
+    service: Annotated[SystemService, Depends(get_system_service)],
+) -> Response:
+    """下载一个会话的 UTF-8 JSON，文件名使用稳定会话 ID。"""
+
+    content = service.export_session_json(session_id)
+    return Response(
+        content=content,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Disposition": (f'attachment; filename="loreweave-session-{session_id}.json"'),
+        },
+    )
+
+
+@router.get("/export/all")
+def export_all(
+    service: Annotated[SystemService, Depends(get_system_service)],
+) -> FileResponse:
+    """下载全量业务 ZIP，并在响应发送完成后回收受管临时文件。"""
+
+    path = service.create_full_export()
+    filename = f"loreweave-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=filename,
+        background=ResponseBackgroundTask(service.delete_export_file, path),
+    )
+
+
+@router.get(
+    "/logs",
+    response_model=DataResponse[list[LogEntry]],
+)
+def get_logs(
+    request: Request,
+    service: Annotated[SystemService, Depends(get_system_service)],
+    level: Annotated[LogLevelFilter, Query()] = "all",
+    range_: Annotated[LogRange, Query(alias="range")] = "all",
+) -> DataResponse[list[LogEntry]]:
+    """按级别和滚动时间范围返回脱敏日志。"""
+
+    return DataResponse(
+        data=service.list_logs(level=level, range_=range_),
+        request_id=request.state.request_id,
+    )
+
+
+@router.get("/logs/download")
+def download_logs(
+    service: Annotated[SystemService, Depends(get_system_service)],
+    level: Annotated[LogLevelFilter, Query()] = "all",
+    range_: Annotated[LogRange, Query(alias="range")] = "all",
+) -> Response:
+    """下载与日志页面筛选口径一致的 UTF-8 JSON Lines 文件。"""
+
+    return Response(
+        content=service.download_logs(level=level, range_=range_),
+        headers={
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Disposition": 'attachment; filename="loreweave-logs.log"',
+        },
+    )
+
+
+@router.delete(
+    "/logs",
+    response_model=DataResponse[DeleteLogsResult],
+)
+def delete_logs(
+    request: Request,
+    service: Annotated[SystemService, Depends(get_system_service)],
+    level: Annotated[LogLevelFilter, Query()] = "all",
+    range_: Annotated[LogRange, Query(alias="range")] = "all",
+) -> DataResponse[DeleteLogsResult]:
+    """只删除匹配行，并返回实际删除数量。"""
+
+    return DataResponse(
+        data=DeleteLogsResult(count=service.delete_logs(level=level, range_=range_)),
+        request_id=request.state.request_id,
+    )
 
 
 @router.get(

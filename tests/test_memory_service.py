@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -42,6 +44,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from scripts.init_db import initialize_database
+from scripts.manage_tasks import list_failed_memory_tasks, retry_memory_task_once
 
 
 class StubGateway:
@@ -140,10 +143,16 @@ def add_message(
     position: int,
     role: str,
     blocks: list[tuple[str, str]],
+    turn_number: int | None = None,
 ) -> Message:
     """添加一条带连续内容块的测试消息。"""
 
-    message = Message(session_id=session_id, position=position, role=role)
+    message = Message(
+        session_id=session_id,
+        position=position,
+        role=role,
+        turn_number=turn_number,
+    )
     session.add(message)
     session.flush()
     for sequence, (block_type, content) in enumerate(blocks):
@@ -210,6 +219,7 @@ def add_task_context(
             position=position,
             role="user",
             blocks=[("dialogue", f"用户第 {absolute_round} 轮")],
+            turn_number=absolute_round,
         )
         position += 1
         assistant = add_message(
@@ -221,6 +231,7 @@ def add_task_context(
                 ("action", f"第 {absolute_round} 轮动作"),
                 ("dialogue", f"角色第 {absolute_round} 轮台词"),
             ],
+            turn_number=absolute_round,
         )
         position += 1
         source_ids[absolute_round] = (user.id, assistant.id)
@@ -313,7 +324,10 @@ def test_load_target_rounds_selects_exact_interval_and_preserves_sources(
         assert len(rounds) == 10
         assert (rounds[0].batch_round, rounds[0].absolute_round) == (1, 11)
         assert (rounds[-1].batch_round, rounds[-1].absolute_round) == (10, 20)
-        assert (rounds[0].user_message_id, rounds[0].assistant_message_id) == source_ids[11]
+        assert (
+            rounds[0].user_message_id,
+            rounds[0].assistant_message_id,
+        ) == source_ids[11]
         assert "用户：用户第 11 轮" in extraction_input
         assert "[动作] 第 20 轮动作\n[台词] 角色第 20 轮台词" in extraction_input
         assert "开场白" not in extraction_input
@@ -414,7 +428,9 @@ def test_load_target_rounds_rejects_missing_complete_round(tmp_path: Path) -> No
         engine.dispose()
 
 
-def test_exact_duplicate_skips_embedding_and_consolidation_chain(tmp_path: Path) -> None:
+def test_exact_duplicate_skips_embedding_and_consolidation_chain(
+    tmp_path: Path,
+) -> None:
     """当前角色同类型同正文记忆直接去重，并保留候选来源消息。"""
 
     session, engine = create_database(tmp_path)
@@ -427,7 +443,9 @@ def test_exact_duplicate_skips_embedding_and_consolidation_chain(tmp_path: Path)
         )
         configure_models(session, embedding=False)
         content = "用户喜欢在雨天散步。"
-        existing = add_memory(session, character, content=content, memory_type="用户偏好")
+        existing = add_memory(
+            session, character, content=content, memory_type="用户偏好"
+        )
         gateway = StubGateway(
             [
                 (
@@ -454,7 +472,9 @@ def test_exact_duplicate_skips_embedding_and_consolidation_chain(tmp_path: Path)
         engine.dispose()
 
 
-def test_non_duplicate_uses_current_role_similarity_and_merge_decision(tmp_path: Path) -> None:
+def test_non_duplicate_uses_current_role_similarity_and_merge_decision(
+    tmp_path: Path,
+) -> None:
     """非重复候选只把当前角色当前版本的相似记忆交给整合 Chain。"""
 
     session, engine = create_database(tmp_path)
@@ -508,9 +528,13 @@ def test_non_duplicate_uses_current_role_similarity_and_merge_decision(tmp_path:
         assert plans[0].decision.action == "merge"
         assert plans[0].decision.target_memory_id == existing.id
         assert plans[0].source_message_ids == source_ids[3]
-        assert gateway.embedding_requests[0]["texts"] == ["艾拉承诺陪用户寻找旧档案馆。"]
+        assert gateway.embedding_requests[0]["texts"] == [
+            "艾拉承诺陪用户寻找旧档案馆。"
+        ]
         consolidation_payload = json.loads(gateway.chat_requests[1][1]["content"])
-        assert [item["id"] for item in consolidation_payload["existingMemories"]] == [existing.id]
+        assert [item["id"] for item in consolidation_payload["existingMemories"]] == [
+            existing.id
+        ]
         assert foreign.id not in gateway.chat_requests[1][1]["content"]
         assert chroma.queries[0]["where"] == {
             "$and": [
@@ -524,7 +548,9 @@ def test_non_duplicate_uses_current_role_similarity_and_merge_decision(tmp_path:
         engine.dispose()
 
 
-def test_exact_content_from_other_character_does_not_deduplicate(tmp_path: Path) -> None:
+def test_exact_content_from_other_character_does_not_deduplicate(
+    tmp_path: Path,
+) -> None:
     """其他角色的同类型同正文记忆不能成为当前角色的精确去重目标。"""
 
     session, engine = create_database(tmp_path)
@@ -626,7 +652,9 @@ def test_conflicting_actions_for_same_memory_fail_whole_plan(tmp_path: Path) -> 
         engine.dispose()
 
 
-def test_empty_extraction_does_not_call_embedding_or_consolidation(tmp_path: Path) -> None:
+def test_empty_extraction_does_not_call_embedding_or_consolidation(
+    tmp_path: Path,
+) -> None:
     """空候选是合法只读结果，不产生无意义的相似检索或整合调用。"""
 
     session, engine = create_database(tmp_path)
@@ -763,7 +791,10 @@ def test_persist_and_sync_all_memory_actions_atomically(tmp_path: Path) -> None:
         refreshed_invalidated = session.get(LongTermMemory, invalidated.id)
         assert refreshed_updated is not None and refreshed_updated.memory_version == 2
         assert refreshed_updated.index_status == "pending"
-        assert refreshed_invalidated is not None and refreshed_invalidated.status == "invalid"
+        assert (
+            refreshed_invalidated is not None
+            and refreshed_invalidated.status == "invalid"
+        )
         assert session.scalar(select(func.count(MemorySource.memory_id))) == 8
         assert chat_session.consolidated_round == 0
 
@@ -775,10 +806,19 @@ def test_persist_and_sync_all_memory_actions_atomically(tmp_path: Path) -> None:
         refreshed_updated = session.get(LongTermMemory, updated.id)
         refreshed_created = session.get(LongTermMemory, created.id)
         assert refreshed_task is not None and refreshed_task.status == "succeeded"
-        assert (refreshed_task.progress_current, refreshed_task.progress_total) == (10, 10)
-        assert refreshed_session is not None and refreshed_session.consolidated_round == 10
-        assert refreshed_updated is not None and refreshed_updated.index_status == "ready"
-        assert refreshed_created is not None and refreshed_created.embedding_version == 2
+        assert (refreshed_task.progress_current, refreshed_task.progress_total) == (
+            10,
+            10,
+        )
+        assert (
+            refreshed_session is not None and refreshed_session.consolidated_round == 10
+        )
+        assert (
+            refreshed_updated is not None and refreshed_updated.index_status == "ready"
+        )
+        assert (
+            refreshed_created is not None and refreshed_created.embedding_version == 2
+        )
         assert set(chroma.upserts[0]["ids"]) == {
             memory_document_id(updated.id),
             memory_document_id(created.id),
@@ -790,7 +830,9 @@ def test_persist_and_sync_all_memory_actions_atomically(tmp_path: Path) -> None:
         engine.dispose()
 
 
-def test_memory_task_retry_repairs_index_without_repeating_model_plan(tmp_path: Path) -> None:
+def test_memory_task_retry_repairs_index_without_repeating_model_plan(
+    tmp_path: Path,
+) -> None:
     """索引失败后同一任务复用来源凭据修复，不重复新增或增加版本。"""
 
     session, engine = create_database(tmp_path)
@@ -860,6 +902,55 @@ def test_memory_task_retry_repairs_index_without_repeating_model_plan(tmp_path: 
         engine.dispose()
 
 
+def test_local_task_entry_retries_failed_memory_task_immediately(
+    tmp_path: Path,
+) -> None:
+    """本地管理入口把 failed 任务重置，并在独立 Session 中立即执行完成。"""
+
+    settings = Settings(environment="test", data_dir=tmp_path)
+    session, engine = create_database(tmp_path)
+    try:
+        _character, chat_session, task, _source_ids = add_task_context(
+            session,
+            round_count=10,
+            consolidated_round=0,
+            target_round=10,
+        )
+        configure_models(session)
+        task.status = "failed"
+        task.error_message = "长期记忆整理失败"
+        session.commit()
+        task_id = task.id
+        session_id = chat_session.id
+    finally:
+        session.close()
+        engine.dispose()
+
+    assert list_failed_memory_tasks(settings) == [
+        (task_id, session_id, 10, "长期记忆整理失败")
+    ]
+    final_status = asyncio.run(
+        retry_memory_task_once(
+            task_id,
+            settings,
+            StubGateway(['{"candidates":[]}']),
+            RecordingChroma(),
+        )
+    )
+
+    assert final_status == "succeeded"
+    verify_engine = create_database_engine(settings)
+    try:
+        with create_session_factory(verify_engine)() as verify_session:
+            retried_task = verify_session.get(BackgroundTask, task_id)
+            retried_session = verify_session.get(ChatSession, session_id)
+            assert retried_task is not None and retried_task.status == "succeeded"
+            assert retried_session is not None
+            assert retried_session.consolidated_round == 10
+    finally:
+        verify_engine.dispose()
+
+
 def test_invalidation_delete_failure_records_cleanup_and_does_not_advance(
     tmp_path: Path,
 ) -> None:
@@ -913,7 +1004,8 @@ def test_invalidation_delete_failure_records_cleanup_and_does_not_advance(
         )
         assert failed_task is not None and failed_task.status == "failed"
         assert refreshed_memory is not None and refreshed_memory.status == "invalid"
-        assert cleanup_task is not None and cleanup_task.scope_id == invalidated.id
+        assert cleanup_task is not None
+        assert cleanup_task.scope_id == memory_document_id(invalidated.id)
         assert session.get(ChatSession, chat_session.id).consolidated_round == 0
 
         chroma.delete_error = None
@@ -976,6 +1068,134 @@ def test_pending_runner_processes_same_session_backlog_in_order(tmp_path: Path) 
         engine.dispose()
 
 
+def test_two_executors_claim_same_memory_task_only_once(tmp_path: Path) -> None:
+    """两个独立 Session 同时领取时，只有一个执行器能完成同一任务。"""
+
+    settings = Settings(environment="test", data_dir=tmp_path)
+    session, engine = create_database(tmp_path)
+    try:
+        _character, chat_session, task, _source_ids = add_task_context(
+            session,
+            round_count=10,
+            consolidated_round=0,
+            target_round=10,
+        )
+        configure_models(session)
+        task_id = task.id
+        session_id = chat_session.id
+    finally:
+        session.close()
+        engine.dispose()
+
+    concurrent_engine = create_database_engine(settings)
+    session_factory = create_session_factory(concurrent_engine)
+    start_barrier = Barrier(2)
+
+    def run_executor() -> bool:
+        """在独立线程和 Session 中同时进入任务原子领取入口。"""
+
+        with session_factory() as worker_session:
+            start_barrier.wait(timeout=5)
+            return asyncio.run(
+                MemoryTask(
+                    worker_session,
+                    StubGateway(['{"candidates":[]}']),
+                    RecordingChroma(),
+                ).run(task_id)
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [
+                future.result(timeout=10)
+                for future in [executor.submit(run_executor) for _index in range(2)]
+            ]
+
+        assert sorted(results) == [False, True]
+        with session_factory() as verify_session:
+            finished_task = verify_session.get(BackgroundTask, task_id)
+            finished_session = verify_session.get(ChatSession, session_id)
+            assert finished_task is not None and finished_task.status == "succeeded"
+            assert finished_session is not None
+            assert finished_session.consolidated_round == 10
+            assert (
+                verify_session.scalar(
+                    select(func.count(BackgroundTask.id)).where(
+                        BackgroundTask.task_type == "memory_consolidation",
+                        BackgroundTask.scope_id == session_id,
+                        BackgroundTask.target_version == 10,
+                    )
+                )
+                == 1
+            )
+    finally:
+        concurrent_engine.dispose()
+
+
+def test_sqlite_plan_commit_failure_rolls_back_and_retries_safely(
+    tmp_path: Path,
+) -> None:
+    """计划提交失败不留下半条记忆或推进轮次，原任务随后可安全重试。"""
+
+    session, engine = create_database(tmp_path)
+    try:
+        _character, chat_session, task, _source_ids = add_task_context(
+            session,
+            round_count=10,
+            consolidated_round=0,
+            target_round=10,
+        )
+        configure_models(session)
+        extraction_response = (
+            '{"candidates":[{"type":"长期目标",'
+            '"content":"用户希望与角色共同修复旧飞船。",'
+            '"importance":5,"sourceRounds":[2]}]}'
+        )
+        consolidation_response = (
+            '{"action":"create",'
+            '"content":"用户希望与角色共同修复旧飞船。","importance":5}'
+        )
+        gateway = StubGateway([extraction_response, consolidation_response])
+        runner = MemoryTask(session, gateway, RecordingChroma())
+        original_commit = session.commit
+        commit_count = 0
+
+        def fail_plan_commit_once() -> None:
+            """只让领取后的计划持久化提交失败，后续失败状态仍可保存。"""
+
+            nonlocal commit_count
+            commit_count += 1
+            if commit_count == 2:
+                raise RuntimeError("sqlite commit failed")
+            original_commit()
+
+        with patch.object(session, "commit", side_effect=fail_plan_commit_once):
+            assert asyncio.run(runner.run(task.id)) is False
+
+        session.expire_all()
+        failed_task = session.get(BackgroundTask, task.id)
+        failed_session = session.get(ChatSession, chat_session.id)
+        assert failed_task is not None and failed_task.status == "failed"
+        assert failed_session is not None and failed_session.consolidated_round == 0
+        assert session.scalar(select(func.count(LongTermMemory.id))) == 0
+        assert session.scalar(select(func.count(MemorySource.memory_id))) == 0
+
+        assert retry_failed_memory_task(session, task.id) is True
+        gateway.chat_responses.extend([extraction_response, consolidation_response])
+        assert asyncio.run(runner.run(task.id)) is True
+
+        session.expire_all()
+        retried_task = session.get(BackgroundTask, task.id)
+        retried_session = session.get(ChatSession, chat_session.id)
+        assert retried_task is not None and retried_task.status == "succeeded"
+        assert retried_session is not None and retried_session.consolidated_round == 10
+        assert session.scalar(select(func.count(LongTermMemory.id))) == 1
+        assert session.scalar(select(func.count(MemorySource.memory_id))) == 2
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def test_recover_interrupted_memory_task_returns_it_to_pending(tmp_path: Path) -> None:
     """应用重启时 running 任务恢复为可重新领取的 pending。"""
 
@@ -1025,7 +1245,9 @@ def test_application_startup_recovers_and_schedules_pending_memory_tasks(
         session.close()
         engine.dispose()
 
-    with patch("app.main.run_pending_memory_tasks", new_callable=AsyncMock) as scheduler:
+    with patch(
+        "app.main.run_pending_memory_tasks", new_callable=AsyncMock
+    ) as scheduler:
         with TestClient(create_app(settings)) as client:
             assert client.get("/api/health").status_code == 200
 

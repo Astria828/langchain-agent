@@ -14,7 +14,13 @@ const NO_BOOK = '__none__';
 export default function NewSessionPage() {
   const navigate = useNavigate();
   const characters = useAppStore((s) => s.characters);
+  const contentLoading = useAppStore((s) => s.contentLoading);
+  const contentError = useAppStore((s) => s.contentError);
+  const loadContent = useAppStore((s) => s.loadContent);
   const worldBooks = useAppStore((s) => s.worldBooks);
+  const worldBooksLoading = useAppStore((s) => s.worldBooksLoading);
+  const worldBooksError = useAppStore((s) => s.worldBooksError);
+  const loadWorldBooks = useAppStore((s) => s.loadWorldBooks);
   const identity = useAppStore((s) => s.identity);
   const startSession = useAppStore((s) => s.startSession);
 
@@ -64,6 +70,33 @@ export default function NewSessionPage() {
           选择角色卡与世界书的组合。创建后身份与角色配置会保存为独立会话快照。
         </div>
 
+        {contentError && (
+          <div className="note-warn" style={{ marginTop: 24 }}>
+            身份与角色卡加载失败：{contentError}
+            <button
+              className="btn-ghost"
+              onClick={() => void loadContent()}
+              disabled={contentLoading}
+              style={{ marginLeft: 12, fontSize: 12 }}
+            >
+              重试
+            </button>
+          </div>
+        )}
+        {worldBooksError && (
+          <div className="note-warn" style={{ marginTop: 12 }}>
+            世界书加载失败：{worldBooksError}
+            <button
+              className="btn-ghost"
+              onClick={() => void loadWorldBooks()}
+              disabled={worldBooksLoading}
+              style={{ marginLeft: 12, fontSize: 12 }}
+            >
+              重试
+            </button>
+          </div>
+        )}
+
         <div style={{ fontSize: 12, letterSpacing: '.18em', color: 'var(--accent-deep)', margin: '38px 0 16px' }}>
           ① 选择角色卡
         </div>
@@ -100,6 +133,14 @@ export default function NewSessionPage() {
               </div>
             </div>
           ))}
+          {contentLoading && characters.length === 0 && (
+            <div style={{ fontSize: 13, color: 'var(--text-dim-3)' }}>正在读取角色卡…</div>
+          )}
+          {!contentLoading && !contentError && characters.length === 0 && (
+            <div style={{ fontSize: 13, color: 'var(--text-dim-3)' }}>
+              还没有角色卡，请先在角色卡页面创建。
+            </div>
+          )}
         </div>
 
         <div style={{ fontSize: 12, letterSpacing: '.18em', color: 'var(--accent-deep)', margin: '38px 0 16px' }}>
@@ -131,6 +172,9 @@ export default function NewSessionPage() {
               </div>
             </div>
           ))}
+          {worldBooksLoading && worldBooks.length === 0 && (
+            <div style={{ fontSize: 13, color: 'var(--text-dim-3)' }}>正在读取世界书…</div>
+          )}
           <div
             className="card-pick"
             onClick={() => setPickedBook(NO_BOOK)}
@@ -182,7 +226,14 @@ export default function NewSessionPage() {
         <button
           className="btn-primary"
           onClick={() => void start()}
-          disabled={!pickedCharacter || busy}
+          disabled={
+            !pickedCharacter ||
+            !identity ||
+            busy ||
+            contentLoading ||
+            !!contentError ||
+            ((worldBooksLoading || !!worldBooksError) && pickedBook !== NO_BOOK)
+          }
           style={{
             marginTop: 40,
             width: '100%',

@@ -1,11 +1,18 @@
-"""阶段 1B 的 Windows DPAPI 与日志脱敏测试。"""
+"""Windows DPAPI、结构化日志上下文与脱敏测试。"""
 
+import json
 import logging
 from pathlib import Path
 
 import pytest
 from app.core.config import Settings
-from app.core.logging import REDACTED, configure_logging, sanitize_log_text
+from app.core.logging import (
+    REDACTED,
+    bind_request_id,
+    configure_logging,
+    reset_request_id,
+    sanitize_log_text,
+)
 from app.core.security import api_key_tail, protect_api_key, unprotect_api_key
 from app.db.database import create_database_engine
 from sqlalchemy import text
@@ -75,20 +82,52 @@ def test_log_sanitizer_removes_common_secret_shapes(raw: str, secret: str) -> No
 
 
 def test_rotating_log_handler_writes_utf8_and_redacts(tmp_path: Path) -> None:
-    """应用日志按 UTF-8 写入指定目录，并在落盘前脱敏。"""
+    """应用日志按 UTF-8 JSON Lines 落盘，并自动携带请求上下文和业务 ID。"""
 
     settings = Settings(environment="test", data_dir=tmp_path)
     log_path = configure_logging(settings)
     logger = logging.getLogger("app.test")
     secret = "sk-logfile-secret-87654321"
-    logger.warning(
-        "连接失败 api_key=%s 中文信息", secret, extra={"request_id": "req_test"}
-    )
+    token = bind_request_id("req_test")
+    try:
+        logger.warning(
+            "连接失败 api_key=%s 中文信息",
+            secret,
+            extra={
+                "event": "model_connection_failed",
+                "business_ids": {"group": "main"},
+            },
+        )
+    finally:
+        reset_request_id(token)
     for handler in logging.getLogger("app").handlers:
         handler.flush()
 
     log_content = log_path.read_text(encoding="utf-8")
-    assert "中文信息" in log_content
-    assert "request_id=req_test" in log_content
+    record = json.loads(log_content.splitlines()[-1])
+    assert record["timestamp"].endswith("Z")
+    assert record["level"] == "WARNING"
+    assert record["module"] == "app.test"
+    assert record["event"] == "model_connection_failed"
+    assert record["requestId"] == "req_test"
+    assert record["businessIds"] == {"group": "main"}
+    assert "中文信息" in record["message"]
     assert secret not in log_content
-    assert REDACTED in log_content
+    assert REDACTED in record["message"]
+
+
+def test_production_file_handler_ignores_debug_records(tmp_path: Path) -> None:
+    """生产环境文件日志最低为 INFO，仍保留标准 INFO 事件。"""
+
+    settings = Settings(environment="production", data_dir=tmp_path)
+    log_path = configure_logging(settings)
+    logger = logging.getLogger("app.production_test")
+    logger.debug("不应写入", extra={"event": "debug_hidden"})
+    logger.info("正常信息", extra={"event": "info_visible"})
+    for handler in logging.getLogger("app").handlers:
+        handler.flush()
+
+    records = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["event"] for record in records] == ["info_visible"]

@@ -38,7 +38,13 @@ def recover_interrupted_memory_tasks(session: Session) -> int:
         )
     )
     session.commit()
-    logger.warning("已恢复 %s 个中断的长期记忆整理任务", len(task_ids))
+    logger.warning(
+        "已恢复中断的长期记忆整理任务",
+        extra={
+            "event": "memory_tasks_recovered",
+            "business_ids": {"count": len(task_ids)},
+        },
+    )
     return len(task_ids)
 
 
@@ -88,10 +94,24 @@ class MemoryTask:
                 plans = await service.extract_and_consolidate(task_id)
                 service.persist_consolidation_plans(task_id, plans)
             await service.synchronize_and_finish(task_id)
+            logger.info(
+                "长期记忆整理任务完成",
+                extra={
+                    "event": "memory_consolidation_completed",
+                    "business_ids": {"taskId": task_id},
+                },
+            )
             return True
         except Exception as exc:
             self._finish_failure(task_id, service)
-            logger.exception("长期记忆整理任务失败 task_id=%s", task_id, exc_info=exc)
+            logger.exception(
+                "长期记忆整理任务失败",
+                exc_info=exc,
+                extra={
+                    "event": "memory_consolidation_failed",
+                    "business_ids": {"taskId": task_id},
+                },
+            )
             return False
 
     def _claim(self, task_id: str) -> bool:
@@ -132,6 +152,7 @@ class MemoryTask:
         task.finished_at = utc_now()
         self.session.commit()
 
+
 async def run_pending_memory_tasks(
     settings: Settings,
     gateway: ModelGateway | None = None,
@@ -168,6 +189,9 @@ async def run_pending_memory_tasks(
                 await MemoryTask(session, resolved_gateway, resolved_chroma).run(task_id)
                 session.expire_all()
     except Exception:
-        logger.exception("长期记忆后台调度器异常")
+        logger.exception(
+            "长期记忆后台调度器异常",
+            extra={"event": "memory_scheduler_failed", "business_ids": {}},
+        )
     finally:
         engine.dispose()

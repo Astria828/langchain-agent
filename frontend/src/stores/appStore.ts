@@ -7,7 +7,7 @@
 
 import { create } from 'zustand';
 import { client } from '@/services/api';
-import { streamChat } from '@/services/chatStream';
+import { streamChat, streamMessageAction } from '@/services/chatStream';
 import type {
   Character,
   ChatStreamEvent,
@@ -18,6 +18,7 @@ import type {
   LogRange,
   LongTermMemory,
   Message,
+  MessageAction,
   MessageBlock,
   MemoryStatus,
   MemoryType,
@@ -81,19 +82,28 @@ interface AppState {
 
   /* ── 会话与消息 ─────────────────────────────────────── */
   sessions: Session[];
+  sessionsLoading: boolean;
+  sessionsError: string | null;
   currentSessionId: string | null;
   messages: Message[];
   /** 流式生成中的助手消息，未落库 */
   streaming: Message | null;
   streamRetrieved: string[];
+  messageActionPending: { messageId: string; action: MessageAction } | null;
+  loadSessions: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
   startSession: (payload: CreateSessionPayload) => Promise<Session | null>;
   renameSession: (id: string, title: string) => Promise<boolean>;
   removeSession: (id: string) => Promise<void>;
+  removeTurn: (assistantMessageId: string) => Promise<boolean>;
+  runMessageAction: (assistantMessageId: string, action: MessageAction) => Promise<void>;
+  recommendReply: () => Promise<string | null>;
   send: (text: string) => Promise<void>;
 
   /* ── 长期记忆 ───────────────────────────────────────── */
   memories: LongTermMemory[];
+  memoriesLoading: boolean;
+  memoriesError: string | null;
   loadMemories: (query?: {
     characterId?: string;
     type?: MemoryType;
@@ -116,6 +126,8 @@ interface AppState {
 
   /* ── 日志 ───────────────────────────────────────────── */
   logs: LogEntry[];
+  logsLoading: boolean;
+  logsError: string | null;
   logLevel: LogLevel | 'all';
   logRange: LogRange;
   setLogLevel: (level: LogLevel | 'all') => void;
@@ -141,16 +153,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   worldBooksLoading: false,
   worldBooksError: null,
   sessions: [],
+  sessionsLoading: false,
+  sessionsError: null,
   currentSessionId: null,
   messages: [],
   streaming: null,
   streamRetrieved: [],
+  messageActionPending: null,
   memories: [],
+  memoriesLoading: false,
+  memoriesError: null,
   modelSettings: null,
   modelSettingsLoading: false,
   modelSettingsError: null,
   rebuildRequired: false,
   logs: [],
+  logsLoading: false,
+  logsError: null,
   logLevel: 'all',
   logRange: 'all',
 
@@ -167,22 +186,15 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   bootstrap: async () => {
     if (get().bootstrapped) return;
-    try {
-      const sessions = await client.listSessions();
-      const first = sessions[0] ?? null;
-      const messages = first ? await client.listMessages(first.id) : [];
-      set({
-        sessions,
-        currentSessionId: first?.id ?? null,
-        messages,
-      });
-    } catch (err) {
-      get().flash(errText(err));
-    } finally {
-      set({ bootstrapped: true });
-    }
-    // 已实现的真实业务域独立加载，未实现的 Mock 页面互不阻塞。
-    await Promise.all([get().loadContent(), get().loadWorldBooks(), get().loadModelSettings()]);
+    // 各业务域独立加载，单个接口失败不阻塞其他页面进入可用状态。
+    await Promise.all([
+      get().loadSessions(),
+      get().loadContent(),
+      get().loadWorldBooks(),
+      get().loadModelSettings(),
+      get().loadMemories(),
+    ]);
+    set({ bootstrapped: true });
   },
 
   /* ── 身份 ───────────────────────────────────────────── */
@@ -409,10 +421,37 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   /* ── 会话与消息 ─────────────────────────────────────── */
+  loadSessions: async () => {
+    set({ sessionsLoading: true, sessionsError: null });
+    try {
+      const sessions = await client.listSessions();
+      const currentId = get().currentSessionId;
+      const selected = sessions.find((session) => session.id === currentId) ?? sessions[0] ?? null;
+      const messages = selected ? await client.listMessages(selected.id) : [];
+      set({
+        sessions,
+        currentSessionId: selected?.id ?? null,
+        messages,
+        sessionsError: null,
+      });
+    } catch (err) {
+      const message = errText(err);
+      set({ sessionsError: message });
+      get().flash(message);
+    } finally {
+      set({ sessionsLoading: false });
+    }
+  },
   selectSession: async (id) => {
     const session = get().sessions.find((s) => s.id === id);
     if (!session) return;
-    set({ currentSessionId: id, messages: [], streaming: null, streamRetrieved: [] });
+    set({
+      currentSessionId: id,
+      messages: [],
+      streaming: null,
+      streamRetrieved: [],
+      messageActionPending: null,
+    });
     try {
       const messages = await client.listMessages(id);
       // 载入期间用户可能又切走了，丢弃过期响应
@@ -434,6 +473,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         messages,
         streaming: null,
         streamRetrieved: [],
+        messageActionPending: null,
       }));
       get().flash(`新会话已创建 · 已载入「${character?.name ?? ''}」角色快照`);
       return session;
@@ -460,12 +500,71 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ sessions: rest });
       if (get().currentSessionId === id) {
         const next = rest[0] ?? null;
-        set({ currentSessionId: next?.id ?? null, messages: [], streaming: null, streamRetrieved: [] });
+        set({
+          currentSessionId: next?.id ?? null,
+          messages: [],
+          streaming: null,
+          streamRetrieved: [],
+          messageActionPending: null,
+        });
         if (next) set({ messages: await client.listMessages(next.id) });
       }
       get().flash(`已删除「${target?.title ?? '对话'}」`);
     } catch (err) {
       get().flash(errText(err));
+    }
+  },
+
+  removeTurn: async (assistantMessageId) => {
+    const { currentSessionId, streaming, messageActionPending } = get();
+    if (!currentSessionId || streaming || messageActionPending) return false;
+    try {
+      await client.deleteTurn(currentSessionId, assistantMessageId);
+      const [messages, sessions] = await Promise.all([
+        client.listMessages(currentSessionId),
+        client.listSessions(),
+      ]);
+      if (get().currentSessionId !== currentSessionId) return true;
+      set({ messages, sessions });
+      get().flash('已删除最后一轮对话');
+      return true;
+    } catch (err) {
+      get().flash(errText(err));
+      return false;
+    }
+  },
+
+  runMessageAction: async (assistantMessageId, action) => {
+    const { currentSessionId, streaming, messageActionPending } = get();
+    if (!currentSessionId || streaming || messageActionPending) return;
+    set({ messageActionPending: { messageId: assistantMessageId, action } });
+    try {
+      await streamMessageAction(currentSessionId, assistantMessageId, action, (event) => {
+        if (event.type === 'error') get().flash(event.message);
+      });
+      const [messages, sessions] = await Promise.all([
+        client.listMessages(currentSessionId),
+        client.listSessions(),
+      ]);
+      if (get().currentSessionId !== currentSessionId) return;
+      set({ messages, sessions });
+    } catch (err) {
+      get().flash(errText(err));
+    } finally {
+      if (get().currentSessionId === currentSessionId) {
+        set({ messageActionPending: null });
+      }
+    }
+  },
+
+  recommendReply: async () => {
+    const { currentSessionId, streaming, messageActionPending } = get();
+    if (!currentSessionId || streaming || messageActionPending) return null;
+    try {
+      return (await client.recommendedReply(currentSessionId)).content;
+    } catch (err) {
+      get().flash(errText(err));
+      return null;
     }
   },
 
@@ -475,7 +574,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().flash('请先新建一个对话');
       return;
     }
-    if (get().streaming) return;
+    if (get().streaming || get().messageActionPending) return;
 
     const now = new Date().toISOString();
     const userMessage: Message = {
@@ -558,10 +657,15 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   /* ── 长期记忆 ───────────────────────────────────────── */
   loadMemories: async (query) => {
+    set({ memories: [], memoriesLoading: true, memoriesError: null });
     try {
-      set({ memories: await client.listMemories(query) });
+      set({ memories: await client.listMemories(query), memoriesError: null });
     } catch (err) {
-      get().flash(errText(err));
+      const message = errText(err);
+      set({ memoriesError: message });
+      get().flash(message);
+    } finally {
+      set({ memoriesLoading: false });
     }
   },
   invalidateMemory: async (id) => {
@@ -647,21 +751,26 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   refreshLogs: async () => {
     const query: LogQuery = { level: get().logLevel, range: get().logRange };
+    set({ logs: [], logsLoading: true, logsError: null });
     try {
-      set({ logs: await client.listLogs(query) });
+      set({ logs: await client.listLogs(query), logsError: null });
     } catch (err) {
-      get().flash(errText(err));
+      const message = errText(err);
+      set({ logsError: message });
+      get().flash(message);
+    } finally {
+      set({ logsLoading: false });
     }
   },
   clearLogs: async () => {
     const query: LogQuery = { level: get().logLevel, range: get().logRange };
     try {
       const { count } = await client.deleteLogs(query);
+      await get().refreshLogs();
       if (!count) {
         get().flash('当前筛选条件下没有日志');
         return;
       }
-      await get().refreshLogs();
       get().flash(`已删除 ${count} 条日志`);
     } catch (err) {
       get().flash(errText(err));

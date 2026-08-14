@@ -8,22 +8,22 @@
  *   retrieval / block_start / block_delta / block_end / memo / done / error
  */
 
-import type { ChatStreamEvent } from '@/types';
+import type { ChatStreamEvent, MessageAction } from '@/types';
 
 export type ChatStreamHandler = (event: ChatStreamEvent) => void;
 
-async function realStreamChat(
-  sessionId: string,
-  text: string,
+async function streamRequest(
+  path: string,
+  body: unknown,
   onEvent: ChatStreamHandler,
   signal?: AbortSignal,
 ): Promise<void> {
   let res: Response;
   try {
-    res = await fetch(`/api/sessions/${sessionId}/messages`, {
+    res = await fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-      body: JSON.stringify({ content: text }),
+      ...(body === undefined ? null : { body: JSON.stringify(body) }),
       signal,
     });
   } catch (err) {
@@ -88,4 +88,24 @@ async function realStreamChat(
  * 发送一条用户消息并接收真实后端的流式角色回复。
  * 会话域已进入阶段 5，不再使用模拟剧本。
  */
-export const streamChat = realStreamChat;
+export const streamChat = (
+  sessionId: string,
+  text: string,
+  onEvent: ChatStreamHandler,
+  signal?: AbortSignal,
+) => streamRequest(`/api/sessions/${sessionId}/messages`, { content: text }, onEvent, signal);
+
+/** 对最后一条助手回复执行重说或继续说，并复用同一 SSE 事件契约。 */
+export const streamMessageAction = (
+  sessionId: string,
+  messageId: string,
+  action: MessageAction,
+  onEvent: ChatStreamHandler,
+  signal?: AbortSignal,
+) =>
+  streamRequest(
+    `/api/sessions/${sessionId}/messages/${messageId}/${action}`,
+    undefined,
+    onEvent,
+    signal,
+  );

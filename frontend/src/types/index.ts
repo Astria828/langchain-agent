@@ -27,6 +27,12 @@ export interface Message {
   retrieved?: string[];
 }
 
+export interface RecommendedReply {
+  content: string;
+}
+
+export type MessageAction = 'regenerate' | 'continue';
+
 /* ── 用户身份（PRD §3.1，验收 1：仅三个字段） ─────────────── */
 
 export interface UserIdentity {
@@ -103,6 +109,11 @@ export interface Session {
   characterId: string;
   worldBookId: string | null;
   identitySnapshotId: string;
+  /** 会话创建时冻结的身份与内容名称，用于历史归档稳定展示 */
+  identityName: string;
+  identityPersonaName: string;
+  characterName: string;
+  worldBookName: string | null;
   roundCount: number;
   consolidatedRound: number;
   summary: string;
@@ -185,8 +196,12 @@ export interface LogEntry {
   level: LogLevel;
   /** 事件所属模块 */
   module: string;
+  /** 可筛选和定位的稳定事件名 */
+  event: string;
   requestId: string;
   message: string;
+  /** 用于定位任务、会话、角色等业务对象的脱敏标识 */
+  businessIds: Record<string, string>;
 }
 
 export type LogRange = 'all' | '1d' | '7d' | '30d';

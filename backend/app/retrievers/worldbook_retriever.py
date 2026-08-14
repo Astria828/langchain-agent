@@ -75,8 +75,7 @@ class WorldBookRetriever:
                 select(SessionWorldBookEntrySnapshot)
                 .join(
                     SessionContextSnapshot,
-                    SessionContextSnapshot.id
-                    == SessionWorldBookEntrySnapshot.context_snapshot_id,
+                    SessionContextSnapshot.id == SessionWorldBookEntrySnapshot.context_snapshot_id,
                 )
                 .where(SessionContextSnapshot.session_id == session_id)
                 .order_by(
@@ -120,8 +119,7 @@ class WorldBookRetriever:
         ready_snapshots = {
             snapshot.id: snapshot
             for snapshot in snapshots
-            if snapshot.index_status == "ready"
-            and snapshot.embedding_version == embedding_version
+            if snapshot.index_status == "ready" and snapshot.embedding_version == embedding_version
         }
         if not ready_snapshots:
             return []

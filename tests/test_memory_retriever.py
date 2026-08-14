@@ -104,22 +104,30 @@ def test_memory_retrieval_applies_role_filter_top_k_and_cosine_threshold(
     engine, session = create_database(tmp_path)
     try:
         character = add_character(session, "艾拉")
-        first = add_memory(session, character, content="用户喜欢胶片相机。", memory_type="用户偏好")
-        edge = add_memory(session, character, content="艾拉答应一起看海。", memory_type="角色承诺")
+        first = add_memory(
+            session, character, content="用户喜欢胶片相机。", memory_type="用户偏好"
+        )
+        edge = add_memory(
+            session, character, content="艾拉答应一起看海。", memory_type="角色承诺"
+        )
         below_threshold = add_memory(session, character, content="曾经路过北境。")
         chroma = RecordingChroma(
             {
-                "ids": [[
-                    memory_document_id(first.id),
-                    memory_document_id(edge.id),
-                    memory_document_id(below_threshold.id),
-                ]],
+                "ids": [
+                    [
+                        memory_document_id(first.id),
+                        memory_document_id(edge.id),
+                        memory_document_id(below_threshold.id),
+                    ]
+                ],
                 "distances": [[0.05, 0.30, 0.300001]],
-                "metadatas": [[
-                    vector_metadata(first),
-                    vector_metadata(edge),
-                    vector_metadata(below_threshold),
-                ]],
+                "metadatas": [
+                    [
+                        vector_metadata(first),
+                        vector_metadata(edge),
+                        vector_metadata(below_threshold),
+                    ]
+                ],
             }
         )
 
@@ -170,17 +178,21 @@ def test_memory_results_must_match_current_sqlite_record(tmp_path: Path) -> None
         foreign = add_memory(session, other_character, content="其他角色的经历。")
         chroma = RecordingChroma(
             {
-                "ids": [[
-                    memory_document_id(stale_hash.id),
-                    memory_document_id(invalid.id),
-                    memory_document_id(foreign.id),
-                ]],
+                "ids": [
+                    [
+                        memory_document_id(stale_hash.id),
+                        memory_document_id(invalid.id),
+                        memory_document_id(foreign.id),
+                    ]
+                ],
                 "distances": [[0.10, 0.10, 0.10]],
-                "metadatas": [[
-                    vector_metadata(stale_hash),
-                    vector_metadata(invalid, status="active"),
-                    vector_metadata(foreign),
-                ]],
+                "metadatas": [
+                    [
+                        vector_metadata(stale_hash),
+                        vector_metadata(invalid, status="active"),
+                        vector_metadata(foreign),
+                    ]
+                ],
             }
         )
 

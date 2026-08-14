@@ -370,6 +370,13 @@ export const mockApi: ApiClient = {
       characterId: payload.characterId,
       worldBookId: payload.worldBookId,
       identitySnapshotId: db.identity.id,
+      identityName: db.identity.name,
+      identityPersonaName: db.identity.personaName,
+      characterName: character!.name,
+      worldBookName:
+        payload.worldBookId === null
+          ? null
+          : (db.worldBooks.find((book) => book.id === payload.worldBookId)?.name ?? null),
       roundCount: 0,
       consolidatedRound: 0,
       summary: '尚未生成摘要。',
@@ -405,6 +412,19 @@ export const mockApi: ApiClient = {
     return delay(undefined);
   },
   listMessages: (sessionId) => delay(clone(db.messages[sessionId] ?? [])),
+  deleteTurn: (sessionId, assistantMessageId) => {
+    const messages = db.messages[sessionId] ?? [];
+    const assistantIndex = messages.findIndex((message) => message.id === assistantMessageId);
+    if (assistantIndex < 0) notFound('消息');
+    const firstIndex =
+      assistantIndex > 0 && messages[assistantIndex - 1].role === 'user'
+        ? assistantIndex - 1
+        : assistantIndex;
+    messages.splice(firstIndex, assistantIndex - firstIndex + 1);
+    save();
+    return delay(undefined);
+  },
+  recommendedReply: () => delay({ content: '我们接下来该怎么做？' }),
 
   /* ── 长期记忆 ─────────────────────────────────────────── */
   listMemories: (query) =>

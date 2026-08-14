@@ -55,7 +55,9 @@ def add_chat_session(
     """创建带可选世界书绑定和不可变上下文快照的会话。"""
 
     character = Character(name="艾拉")
-    world_book = WorldBook(name="银港设定", raw_content="原文") if bound_world_book else None
+    world_book = (
+        WorldBook(name="银港设定", raw_content="原文") if bound_world_book else None
+    )
     session.add(character)
     if world_book is not None:
         session.add(world_book)
@@ -84,7 +86,9 @@ def add_chat_session(
         character_dialogue_examples_json="[]",
         world_book_source_id=world_book.id if world_book is not None else None,
         world_book_name=world_book.name if world_book is not None else None,
-        world_book_raw_content=world_book.raw_content if world_book is not None else None,
+        world_book_raw_content=world_book.raw_content
+        if world_book is not None
+        else None,
     )
     session.add(context)
     session.commit()
@@ -209,17 +213,21 @@ def test_mixed_retrieval_merges_resident_keyword_and_vector_in_order(
         )
         chroma = RecordingChroma(
             {
-                "ids": [[
-                    session_entry_document_id(keyword.id),
-                    session_entry_document_id(vector.id),
-                    session_entry_document_id(below_threshold.id),
-                ]],
+                "ids": [
+                    [
+                        session_entry_document_id(keyword.id),
+                        session_entry_document_id(vector.id),
+                        session_entry_document_id(below_threshold.id),
+                    ]
+                ],
                 "distances": [[0.05, 0.40, 0.400001]],
-                "metadatas": [[
-                    vector_metadata(keyword, chat_session),
-                    vector_metadata(vector, chat_session),
-                    vector_metadata(below_threshold, chat_session),
-                ]],
+                "metadatas": [
+                    [
+                        vector_metadata(keyword, chat_session),
+                        vector_metadata(vector, chat_session),
+                        vector_metadata(below_threshold, chat_session),
+                    ]
+                ],
             }
         )
 
@@ -230,7 +238,11 @@ def test_mixed_retrieval_merges_resident_keyword_and_vector_in_order(
             embedding_version=2,
         )
 
-        assert [snapshot.id for snapshot in result] == [resident.id, keyword.id, vector.id]
+        assert [snapshot.id for snapshot in result] == [
+            resident.id,
+            keyword.id,
+            vector.id,
+        ]
         assert chroma.queries == [
             {
                 "query_embedding": [0.1, 0.2, 0.3],
@@ -281,17 +293,23 @@ def test_vector_results_must_match_current_sqlite_snapshot(tmp_path: Path) -> No
         )
         chroma = RecordingChroma(
             {
-                "ids": [[
-                    session_entry_document_id(hash_mismatch.id),
-                    session_entry_document_id(stale.id),
-                    session_entry_document_id(foreign.id),
-                ]],
+                "ids": [
+                    [
+                        session_entry_document_id(hash_mismatch.id),
+                        session_entry_document_id(stale.id),
+                        session_entry_document_id(foreign.id),
+                    ]
+                ],
                 "distances": [[0.10, 0.10, 0.10]],
-                "metadatas": [[
-                    vector_metadata(hash_mismatch, chat_session, content_hash="wrong-hash"),
-                    vector_metadata(stale, chat_session),
-                    vector_metadata(foreign, other_session),
-                ]],
+                "metadatas": [
+                    [
+                        vector_metadata(
+                            hash_mismatch, chat_session, content_hash="wrong-hash"
+                        ),
+                        vector_metadata(stale, chat_session),
+                        vector_metadata(foreign, other_session),
+                    ]
+                ],
             }
         )
 

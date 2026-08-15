@@ -69,12 +69,20 @@ class StubGateway:
         return [[0.1, 0.2, 0.3] for _text in kwargs["texts"]]
 
     async def create_chat_completion(self, **kwargs) -> str:
-        """记录基础对话上下文，并返回或抛出受控主模型结果。"""
+        """记录非流式模型上下文，并返回或抛出受控主模型结果。"""
 
         self.chat_requests.append(kwargs["messages"])
         if self.chat_error is not None:
             raise self.chat_error
         return self.chat_response
+
+    async def stream_chat_completion(self, **kwargs):
+        """记录交互对话上下文，并返回一个完整的测试网络分片。"""
+
+        self.chat_requests.append(kwargs["messages"])
+        if self.chat_error is not None:
+            raise self.chat_error
+        yield self.chat_response
 
 
 class RecordingChroma:
@@ -500,6 +508,16 @@ def test_basic_chat_turn_saves_user_then_atomic_assistant_blocks(
             "sequence": 0,
             "blockType": "action",
         }
+        assert events[1] == {
+            "type": "block_delta",
+            "sequence": 0,
+            "text": "她抬起头。",
+        }
+        assert events[4] == {
+            "type": "block_delta",
+            "sequence": 1,
+            "text": "你终于来了。",
+        }
         assert events[-1]["roundCount"] == 1
         messages = service.list_messages(created.id)
         assert [message.role for message in messages] == [
@@ -783,7 +801,13 @@ def test_memory_task_failure_rolls_back_assistant_reply_and_round(
         session.expire_all()
         refreshed = session.get(ChatSession, created.id)
         assert refreshed is not None
-        assert events == [{"type": "error", "message": "角色回复生成失败"}]
+        assert [event["type"] for event in events] == [
+            "block_start",
+            "block_delta",
+            "block_end",
+            "error",
+        ]
+        assert events[-1]["message"] == "角色回复生成失败"
         assert refreshed.round_count == 9
         assert session.scalar(select(func.count(BackgroundTask.id))) == 0
         roles = session.scalars(
@@ -1235,6 +1259,47 @@ def test_model_failure_keeps_user_message_without_partial_assistant(
         engine.dispose()
 
 
+def test_late_invalid_block_discards_preview_and_does_not_save_assistant(
+    tmp_path: Path,
+) -> None:
+    """已有完整块被展示后协议才损坏时，仍不保存部分助手消息。"""
+
+    gateway = StubGateway(
+        chat_response=(
+            '{"blocks":['
+            '{"type":"action","content":"她抬起头。"},'
+            "invalid]}"
+        )
+    )
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+
+        events = collect_basic_reply_events(service, created.id, "请回应我。")
+
+        assert [event["type"] for event in events] == [
+            "block_start",
+            "block_delta",
+            "block_end",
+            "error",
+        ]
+        assert events[-1]["message"] == "主模型返回的内容块结构无效"
+        assert [message.role for message in service.list_messages(created.id)] == [
+            "assistant",
+            "user",
+        ]
+        assert service.list_sessions()[0].round_count == 0
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def test_unconfigured_main_model_rejects_before_saving_user_message(
     tmp_path: Path,
 ) -> None:
@@ -1308,6 +1373,15 @@ def test_last_reply_can_regenerate_continue_and_delete_in_place(tmp_path: Path) 
         )
         regenerate_events = asyncio.run(run_action("regenerate"))
         regenerated = service.list_messages(created.id)[-1]
+        assert [event["type"] for event in regenerate_events] == [
+            "block_start",
+            "block_delta",
+            "block_end",
+            "block_start",
+            "block_delta",
+            "block_end",
+            "done",
+        ]
         assert regenerate_events[-1]["messageId"] == assistant_id
         assert regenerated.id == assistant_id
         assert [block.content for block in regenerated.blocks] == ["她推开门。", "走吧。"]
@@ -1316,6 +1390,12 @@ def test_last_reply_can_regenerate_continue_and_delete_in_place(tmp_path: Path) 
         gateway.chat_response = '{"blocks":[{"type":"dialogue","content":"别落下。"}]}'
         continue_events = asyncio.run(run_action("continue"))
         continued = service.list_messages(created.id)[-1]
+        assert [event["type"] for event in continue_events] == [
+            "block_start",
+            "block_delta",
+            "block_end",
+            "done",
+        ]
         assert continue_events[-1]["messageId"] == assistant_id
         assert [block.sequence for block in continued.blocks] == [0, 1, 2]
         assert continued.blocks[-1].content == "别落下。"

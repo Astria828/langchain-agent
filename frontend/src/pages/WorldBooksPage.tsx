@@ -60,7 +60,13 @@ export default function WorldBooksPage() {
   const book = worldBooks.find((b) => b.id === selectedId) ?? null;
   const staleCount = book?.entries.filter((e) => e.indexStale).length ?? 0;
   const draftsValid =
-    drafts.length > 0 && drafts.every((draft) => draft.name.trim() && draft.content.trim());
+    drafts.length > 0 &&
+    drafts.every(
+      (draft) =>
+        draft.name.trim() &&
+        draft.content.trim() &&
+        draft.keywords.some((keyword) => keyword.trim()),
+    );
 
   const runSplit = async () => {
     if (!book) return;
@@ -407,27 +413,6 @@ export default function WorldBooksPage() {
                               }
                               style={{ flex: 'none', width: 140, fontSize: 14, padding: '3px 2px' }}
                             />
-                            <input
-                              className="input-tag"
-                              value={d.category}
-                              onChange={(e) =>
-                                setDrafts((prev) =>
-                                  prev.map((x, j) =>
-                                    j === i ? { ...x, category: e.target.value } : x,
-                                  ),
-                                )
-                              }
-                              placeholder="分类"
-                              style={{
-                                fontSize: 11,
-                                color: 'var(--accent-pale)',
-                                padding: '3px 10px',
-                                borderRadius: 12,
-                                background: 'rgba(240,163,94,.1)',
-                                border: '1px solid rgba(240,163,94,.18)',
-                                whiteSpace: 'nowrap',
-                              }}
-                            />
                             <div style={{ flex: 1 }} />
                             <button
                               className="x-btn"
@@ -453,6 +438,59 @@ export default function WorldBooksPage() {
                               lineHeight: 1.8,
                             }}
                           />
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 14,
+                              marginTop: 10,
+                            }}
+                          >
+                            <input
+                              className="input-underline"
+                              value={d.keywords.join('、')}
+                              onChange={(e) =>
+                                setDrafts((prev) =>
+                                  prev.map((x, j) =>
+                                    j === i
+                                      ? {
+                                          ...x,
+                                          keywords: e.target.value
+                                            .split(/[、，,]/)
+                                            .map((keyword) => keyword.trim())
+                                            .filter(Boolean),
+                                        }
+                                      : x,
+                                  ),
+                                )
+                              }
+                              placeholder="触发关键词，用顿号分隔"
+                              style={{ flex: 1, fontSize: 12.5, padding: '5px 2px' }}
+                            />
+                            <label
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 6,
+                                flex: 'none',
+                                fontSize: 12,
+                                color: 'var(--text-quiet)',
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={d.resident}
+                                onChange={(e) =>
+                                  setDrafts((prev) =>
+                                    prev.map((x, j) =>
+                                      j === i ? { ...x, resident: e.target.checked } : x,
+                                    ),
+                                  )
+                                }
+                              />
+                              常驻条目
+                            </label>
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -494,14 +532,6 @@ export default function WorldBooksPage() {
                       onBlur={(e) => void patchEntry(book.id, entry.id, { name: e.target.value })}
                       placeholder="条目名称"
                       style={{ flex: '1 1 130px', minWidth: 0, fontSize: 15.5, padding: '3px 2px' }}
-                    />
-                    <input
-                      className="input-tag"
-                      value={entry.category}
-                      onChange={(e) => draftEntry(book.id, entry.id, { category: e.target.value })}
-                      onBlur={(e) => void patchEntry(book.id, entry.id, { category: e.target.value })}
-                      placeholder="分类"
-                      style={{ flex: '0 1 64px', minWidth: 44 }}
                     />
                     <button
                       onClick={() => void patchEntry(book.id, entry.id, { resident: !entry.resident })}

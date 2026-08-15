@@ -1,7 +1,8 @@
 """OpenAI-compatible 主模型与 Embedding 连接测试网关。"""
 
 import asyncio
-from json import JSONDecodeError
+from collections.abc import AsyncIterator
+from json import JSONDecodeError, loads
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -38,20 +39,19 @@ class ModelGateway:
         self.transport = transport
 
     async def test_main(self, *, base_url: str, model: str, api_key: str) -> None:
-        """发送一条最小聊天请求并验证返回结构。"""
+        """发送一条最小流式聊天请求并验证主模型支持 SSE。"""
 
-        payload = await self._post(
-            url=f"{normalize_base_url(base_url)}/chat/completions",
+        received_content = False
+        async for content in self.stream_chat_completion(
+            base_url=base_url,
+            model=model,
             api_key=api_key,
-            json_body={
-                "model": model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-                "temperature": 0,
-            },
-        )
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices:
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+        ):
+            if content:
+                received_content = True
+        if not received_content:
             raise AppError(
                 status_code=502,
                 code="MODEL_OUTPUT_INVALID",
@@ -99,6 +99,119 @@ class ModelGateway:
                 message="主模型返回格式无效",
             )
         return content
+
+    async def stream_chat_completion(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str,
+        messages: list[dict[str, str]],
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """调用主模型 SSE，并按上游顺序返回正文增量。"""
+
+        json_body: dict[str, object] = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            json_body["max_tokens"] = max_tokens
+
+        url = f"{normalize_base_url(base_url)}/chat/completions"
+        async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
+            for attempt in range(MAX_ATTEMPTS):
+                emitted_content = False
+                try:
+                    async with client.stream(
+                        "POST",
+                        url,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json=json_body,
+                    ) as response:
+                        if (
+                            response.status_code in TRANSIENT_STATUS_CODES
+                            and attempt + 1 < MAX_ATTEMPTS
+                        ):
+                            await asyncio.sleep(RETRY_DELAY_SECONDS)
+                            continue
+                        if not response.is_success:
+                            raise AppError(
+                                status_code=502,
+                                code="MODEL_CONNECTION_FAILED",
+                                message=f"模型服务调用失败（HTTP {response.status_code}）",
+                            )
+
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if not data:
+                                continue
+                            if data == "[DONE]":
+                                return
+                            try:
+                                payload = loads(data)
+                            except JSONDecodeError as exc:
+                                raise AppError(
+                                    status_code=502,
+                                    code="MODEL_OUTPUT_INVALID",
+                                    message="模型服务返回了无效流式 JSON",
+                                ) from exc
+                            if not isinstance(payload, dict):
+                                raise AppError(
+                                    status_code=502,
+                                    code="MODEL_OUTPUT_INVALID",
+                                    message="模型服务返回格式无效",
+                                )
+
+                            choices = payload.get("choices")
+                            if not isinstance(choices, list):
+                                raise AppError(
+                                    status_code=502,
+                                    code="MODEL_OUTPUT_INVALID",
+                                    message="模型服务返回格式无效",
+                                )
+                            if not choices:
+                                continue
+                            first_choice = choices[0]
+                            delta = (
+                                first_choice.get("delta")
+                                if isinstance(first_choice, dict)
+                                else None
+                            )
+                            content = delta.get("content") if isinstance(delta, dict) else None
+                            if content is None or content == "":
+                                continue
+                            if not isinstance(content, str):
+                                raise AppError(
+                                    status_code=502,
+                                    code="MODEL_OUTPUT_INVALID",
+                                    message="模型服务返回格式无效",
+                                )
+                            emitted_content = True
+                            yield content
+                        return
+                except httpx.TimeoutException as exc:
+                    if not emitted_content and attempt + 1 < MAX_ATTEMPTS:
+                        await asyncio.sleep(RETRY_DELAY_SECONDS)
+                        continue
+                    raise AppError(
+                        status_code=504,
+                        code="MODEL_CONNECTION_TIMEOUT",
+                        message="模型服务连接超时",
+                    ) from exc
+                except httpx.RequestError as exc:
+                    if not emitted_content and attempt + 1 < MAX_ATTEMPTS:
+                        await asyncio.sleep(RETRY_DELAY_SECONDS)
+                        continue
+                    raise AppError(
+                        status_code=502,
+                        code="MODEL_CONNECTION_FAILED",
+                        message="无法连接模型服务",
+                    ) from exc
 
     async def create_embeddings(
         self,

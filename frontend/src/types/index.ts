@@ -97,6 +97,8 @@ export interface WorldBook {
 export interface WorldBookDraftEntry {
   name: string;
   category: string;
+  keywords: string[];
+  resident: boolean;
   content: string;
 }
 

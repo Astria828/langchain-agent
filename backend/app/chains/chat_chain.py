@@ -1,11 +1,16 @@
 """按固定应用规则生成结构化角色回复的对话 Chain。"""
 
+import json
+import re
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.runnables import Runnable, RunnableLambda
+from pydantic import ValidationError
 
+from app.core.exceptions import AppError
 from app.gateways.model_gateway import ModelGateway
 from app.schemas.dto import ChatReplyBlock, ChatReplyOutput, RecommendedReplyOutput
 
@@ -13,40 +18,125 @@ PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "chat.md"
 RECOMMENDED_REPLY_PROMPT_PATH = (
     Path(__file__).resolve().parents[1] / "prompts" / "recommended_reply.md"
 )
+BLOCKS_ARRAY_PATTERN = re.compile(r'"blocks"\s*:\s*\[')
 
 
-def build_basic_chat_chain(
+async def stream_basic_chat_blocks(
     *,
     gateway: ModelGateway,
     base_url: str,
     model: str,
     api_key: str,
-) -> Runnable[list[dict[str, str]], ChatReplyOutput]:
-    """构造固定应用 Prompt、结构校验和保留原文降级的对话 Runnable。"""
+    messages: list[dict[str, str]],
+) -> AsyncIterator[ChatReplyBlock]:
+    """流式读取结构化回复，只在单个动作或台词块完整校验后交付。"""
 
     parser = PydanticOutputParser(pydantic_object=ChatReplyOutput)
     application_prompt = (
         f"{PROMPT_PATH.read_text(encoding='utf-8').strip()}\n\n{parser.get_format_instructions()}"
     )
+    raw_parts: list[str] = []
+    prefix = ""
+    object_chars: list[str] = []
+    emitted_blocks: list[ChatReplyBlock] = []
+    array_started = False
+    array_closed = False
+    object_depth = 0
+    in_string = False
+    escaped = False
 
-    async def generate(messages: list[dict[str, str]]) -> ChatReplyOutput:
-        """调用主模型；协议异常时把完整原文降级为单个 dialogue 块。"""
+    async for delta in gateway.stream_chat_completion(
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        messages=[
+            {"role": "system", "content": application_prompt},
+            *messages,
+        ],
+    ):
+        raw_parts.append(delta)
+        pending = delta
+        if not array_started:
+            prefix += pending
+            match = BLOCKS_ARRAY_PATTERN.search(prefix)
+            if match is None:
+                continue
+            array_started = True
+            pending = prefix[match.end() :]
+            prefix = ""
 
-        raw_response = await gateway.create_chat_completion(
-            base_url=base_url,
-            model=model,
-            api_key=api_key,
-            messages=[
-                {"role": "system", "content": application_prompt},
-                *messages,
-            ],
+        # 从 blocks 数组起逐字符维护 JSON 字符串与花括号状态，避免正文中的符号误判边界。
+        for char in pending:
+            if array_closed:
+                continue
+            if object_depth == 0:
+                if char.isspace() or char == ",":
+                    continue
+                if char == "]":
+                    array_closed = True
+                    continue
+                if char != "{":
+                    raise AppError(
+                        status_code=502,
+                        code="MODEL_OUTPUT_INVALID",
+                        message="主模型返回的内容块结构无效",
+                    )
+                object_chars = [char]
+                object_depth = 1
+                in_string = False
+                escaped = False
+                continue
+
+            object_chars.append(char)
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                object_depth += 1
+            elif char == "}":
+                object_depth -= 1
+                if object_depth == 0:
+                    try:
+                        block_data = json.loads("".join(object_chars))
+                        block = ChatReplyBlock.model_validate(block_data)
+                    except (json.JSONDecodeError, ValidationError) as exc:
+                        raise AppError(
+                            status_code=502,
+                            code="MODEL_OUTPUT_INVALID",
+                            message="主模型返回的内容块结构无效",
+                        ) from exc
+                    emitted_blocks.append(block)
+                    yield block
+                    object_chars = []
+
+    raw_response = "".join(raw_parts)
+    if not array_started or not array_closed or object_depth != 0 or not emitted_blocks:
+        raise AppError(
+            status_code=502,
+            code="MODEL_OUTPUT_INVALID",
+            message="主模型返回的内容块结构不完整",
         )
-        try:
-            return parser.parse(raw_response)
-        except OutputParserException:
-            return ChatReplyOutput(blocks=[ChatReplyBlock(type="dialogue", content=raw_response)])
-
-    return RunnableLambda(generate)
+    try:
+        output = parser.parse(raw_response)
+    except OutputParserException as exc:
+        raise AppError(
+            status_code=502,
+            code="MODEL_OUTPUT_INVALID",
+            message="主模型返回的内容块结构无效",
+        ) from exc
+    if output.blocks != emitted_blocks:
+        raise AppError(
+            status_code=502,
+            code="MODEL_OUTPUT_INVALID",
+            message="主模型返回的内容块前后不一致",
+        )
 
 
 def build_recommended_reply_chain(

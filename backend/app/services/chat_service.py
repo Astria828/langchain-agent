@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DatabaseSession
 
-from app.chains.chat_chain import build_basic_chat_chain, build_recommended_reply_chain
+from app.chains.chat_chain import build_recommended_reply_chain, stream_basic_chat_blocks
 from app.core.exceptions import AppError
 from app.core.security import unprotect_api_key
 from app.db.models import (
@@ -36,6 +36,7 @@ from app.repositories.sqlite_repository import SQLiteRepository
 from app.retrievers.memory_retriever import MemoryRetriever
 from app.retrievers.worldbook_retriever import WorldBookRetriever
 from app.schemas.dto import (
+    ChatReplyBlock,
     ChatReplyOutput,
     CreateSessionPayload,
     Message,
@@ -432,19 +433,25 @@ class ChatService:
         retrieved_entries: list[str],
         user_message_id: str,
     ) -> AsyncIterator[dict[str, object]]:
-        """发送检索提示，生成并保存角色回复，再产生有序内容块事件。"""
+        """发送检索提示，逐块展示角色回复，完整校验后原子保存。"""
 
         if retrieved_entries:
             yield {"type": "retrieval", "entries": retrieved_entries}
 
-        chain = build_basic_chat_chain(
-            gateway=self.gateway,
-            base_url=config.base_url,
-            model=config.model_name,
-            api_key=api_key,
-        )
+        blocks: list[ChatReplyBlock] = []
         try:
-            output = await chain.ainvoke(messages)
+            async for block in stream_basic_chat_blocks(
+                gateway=self.gateway,
+                base_url=config.base_url,
+                model=config.model_name,
+                api_key=api_key,
+                messages=messages,
+            ):
+                sequence = len(blocks)
+                blocks.append(block)
+                for event in self._block_stream_events(block, sequence):
+                    yield event
+            output = ChatReplyOutput(blocks=blocks)
             assistant_message, round_count = self._save_assistant_reply(
                 session_id,
                 user_message_id,
@@ -479,19 +486,6 @@ class ChatService:
             },
         )
 
-        for sequence, block in enumerate(assistant_message.blocks):
-            yield {
-                "type": "block_start",
-                "sequence": sequence,
-                "blockType": block.type,
-            }
-            for offset in range(0, len(block.content), 24):
-                yield {
-                    "type": "block_delta",
-                    "sequence": sequence,
-                    "text": block.content[offset : offset + 24],
-                }
-            yield {"type": "block_end", "sequence": sequence}
         yield {
             "type": "done",
             "messageId": assistant_message.id,
@@ -513,14 +507,20 @@ class ChatService:
 
         if retrieved_entries:
             yield {"type": "retrieval", "entries": retrieved_entries}
-        chain = build_basic_chat_chain(
-            gateway=self.gateway,
-            base_url=config.base_url,
-            model=config.model_name,
-            api_key=api_key,
-        )
+        blocks: list[ChatReplyBlock] = []
         try:
-            output = await chain.ainvoke(messages)
+            async for block in stream_basic_chat_blocks(
+                gateway=self.gateway,
+                base_url=config.base_url,
+                model=config.model_name,
+                api_key=api_key,
+                messages=messages,
+            ):
+                sequence = len(blocks)
+                blocks.append(block)
+                for event in self._block_stream_events(block, sequence):
+                    yield event
+            output = ChatReplyOutput(blocks=blocks)
             if action == "regenerate":
                 assistant_message, round_count = self._replace_assistant_reply(
                     session_id,
@@ -558,8 +558,11 @@ class ChatService:
             yield {"type": "error", "message": "角色回复生成失败"}
             return
 
-        for event in self._message_stream_events(assistant_message, round_count):
-            yield event
+        yield {
+            "type": "done",
+            "messageId": assistant_message.id,
+            "roundCount": round_count,
+        }
 
     def _get_current_identity(self) -> UserIdentity:
         """读取单用户当前身份，缺失表示数据库初始化状态损坏。"""
@@ -1259,27 +1262,17 @@ class ChatService:
         return calculate_content_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
     @staticmethod
-    def _message_stream_events(message: Message, round_count: int) -> list[dict[str, object]]:
-        """把已保存的消息转换为前端复用的 SSE 内容块事件。"""
+    def _block_stream_events(
+        block: ChatReplyBlock,
+        sequence: int,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        """把一个完整内容块转换为块级 SSE 事件，正文只发送一次。"""
 
-        events: list[dict[str, object]] = []
-        for sequence, block in enumerate(message.blocks):
-            events.append(
-                {"type": "block_start", "sequence": sequence, "blockType": block.type}
-            )
-            for offset in range(0, len(block.content), 24):
-                events.append(
-                    {
-                        "type": "block_delta",
-                        "sequence": sequence,
-                        "text": block.content[offset : offset + 24],
-                    }
-                )
-            events.append({"type": "block_end", "sequence": sequence})
-        events.append(
-            {"type": "done", "messageId": message.id, "roundCount": round_count}
+        return (
+            {"type": "block_start", "sequence": sequence, "blockType": block.type},
+            {"type": "block_delta", "sequence": sequence, "text": block.content},
+            {"type": "block_end", "sequence": sequence},
         )
-        return events
 
     def _create_memory_consolidation_task_if_due(self, chat_session: ChatSession) -> None:
         """在新的完整十轮边界创建唯一待处理任务，并与助手回复一同提交。"""

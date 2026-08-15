@@ -216,6 +216,7 @@ export default function ChatPage() {
                   userName={identity?.name ?? ''}
                   chatStyle={chatStyle}
                   showRagHints={showRagHints}
+                  streaming={messageActionPending?.messageId === message.id}
                   actions={
                     message.id === actionableMessageId
                       ? {

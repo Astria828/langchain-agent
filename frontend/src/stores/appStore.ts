@@ -537,10 +537,78 @@ export const useAppStore = create<AppState>((set, get) => ({
   runMessageAction: async (assistantMessageId, action) => {
     const { currentSessionId, streaming, messageActionPending } = get();
     if (!currentSessionId || streaming || messageActionPending) return;
-    set({ messageActionPending: { messageId: assistantMessageId, action } });
+    const originalMessage = get().messages.find((message) => message.id === assistantMessageId);
+    if (!originalMessage) return;
+    const baseSequence = action === 'continue' ? originalMessage.blocks.length : 0;
+    set((s) => ({
+      messageActionPending: { messageId: assistantMessageId, action },
+      messages: s.messages.map((message) =>
+        message.id === assistantMessageId
+          ? { ...message, blocks: action === 'continue' ? message.blocks : [], retrieved: action === 'continue' ? message.retrieved : [] }
+          : message,
+      ),
+    }));
     try {
       await streamMessageAction(currentSessionId, assistantMessageId, action, (event) => {
-        if (event.type === 'error') get().flash(event.message);
+        if (event.type === 'error') {
+          get().flash(event.message);
+          return;
+        }
+        if (event.type === 'retrieval') {
+          set((s) => ({
+            messages: s.messages.map((message) =>
+              message.id === assistantMessageId
+                ? {
+                    ...message,
+                    retrieved:
+                      action === 'continue'
+                        ? [...new Set([...(message.retrieved ?? []), ...event.entries])]
+                        : event.entries,
+                  }
+                : message,
+            ),
+          }));
+          return;
+        }
+        if (event.type === 'block_start') {
+          const sequence = baseSequence + event.sequence;
+          set((s) => ({
+            messages: s.messages.map((message) =>
+              message.id === assistantMessageId
+                ? {
+                    ...message,
+                    blocks: [
+                      ...message.blocks,
+                      {
+                        id: `action_stream_${assistantMessageId}_${sequence}`,
+                        sequence,
+                        type: event.blockType,
+                        content: '',
+                      },
+                    ],
+                  }
+                : message,
+            ),
+          }));
+          return;
+        }
+        if (event.type === 'block_delta') {
+          const sequence = baseSequence + event.sequence;
+          set((s) => ({
+            messages: s.messages.map((message) =>
+              message.id === assistantMessageId
+                ? {
+                    ...message,
+                    blocks: message.blocks.map((block) =>
+                      block.sequence === sequence
+                        ? { ...block, content: block.content + event.text }
+                        : block,
+                    ),
+                  }
+                : message,
+            ),
+          }));
+        }
       });
       const [messages, sessions] = await Promise.all([
         client.listMessages(currentSessionId),
@@ -549,6 +617,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (get().currentSessionId !== currentSessionId) return;
       set({ messages, sessions });
     } catch (err) {
+      if (get().currentSessionId === currentSessionId) {
+        set((s) => ({
+          messages: s.messages.map((message) =>
+            message.id === assistantMessageId ? originalMessage : message,
+          ),
+        }));
+      }
       get().flash(errText(err));
     } finally {
       if (get().currentSessionId === currentSessionId) {

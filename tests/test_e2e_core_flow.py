@@ -35,7 +35,7 @@ class E2EModelGateway:
         return [[0.1, 0.2, 0.3] for _text in kwargs["texts"]]
 
     async def create_chat_completion(self, **kwargs) -> str:
-        """根据系统任务返回对话、记忆提取或整合结果。"""
+        """根据系统任务返回记忆提取或整合结果。"""
 
         system_prompt = kwargs["messages"][0]["content"]
         if "当前任务：长期记忆提取" in system_prompt:
@@ -49,7 +49,12 @@ class E2EModelGateway:
                 '{"action":"create",'
                 '"content":"用户希望与伊瑟共同修复星港。","importance":5}'
             )
-        return (
+        raise AssertionError("基础角色回复必须使用流式模型调用")
+
+    async def stream_chat_completion(self, **_kwargs):
+        """为交互对话返回两块确定的角色回复。"""
+
+        yield (
             '{"blocks":['
             '{"type":"action","content":"她点亮了控制台。"},'
             '{"type":"dialogue","content":"我们继续。"}'

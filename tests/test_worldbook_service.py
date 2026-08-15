@@ -47,7 +47,11 @@ class StubGateway:
     async def create_chat_completion(self, **_kwargs) -> str:
         """避免服务测试访问真实模型。"""
 
-        return '{"drafts":[{"name":"银港","category":"地点","content":"银港终年被海雾笼罩。"}]}'
+        return (
+            '{"drafts":[{"name":"银港","category":"地点",'
+            '"keywords":["银港","海雾"],"resident":false,'
+            '"content":"银港终年被海雾笼罩。"}]}'
+        )
 
     async def create_embeddings(self, **kwargs) -> list[list[float]]:
         """记录向量请求，并按测试场景返回或抛出错误。"""
@@ -265,6 +269,8 @@ def test_split_returns_transient_drafts_without_creating_entries(
         drafts = asyncio.run(service.split_world_book(book.id))
 
         assert drafts[0].name == "银港"
+        assert drafts[0].keywords == ["银港", "海雾"]
+        assert drafts[0].resident is False
         assert service.get_world_book(book.id).entries == []
     finally:
         session.close()
@@ -324,11 +330,15 @@ def test_confirm_drafts_commits_sqlite_before_embedding_and_marks_ready(
                     {
                         "name": "银港",
                         "category": "地点",
+                        "keywords": ["银港", "海雾"],
+                        "resident": True,
                         "content": "银港终年被海雾笼罩。",
                     },
                     {
                         "name": "雾钟",
                         "category": "规则",
+                        "keywords": ["雾钟"],
+                        "resident": False,
                         "content": "雾钟响起后禁止出港。",
                     },
                 ]
@@ -338,10 +348,12 @@ def test_confirm_drafts_commits_sqlite_before_embedding_and_marks_ready(
         entries = asyncio.run(service.confirm_drafts(book.id, payload))
 
         assert [entry.index_stale for entry in entries] == [False, False]
+        assert [entry.keywords for entry in entries] == [["银港", "海雾"], ["雾钟"]]
+        assert [entry.resident for entry in entries] == [True, False]
         assert gateway.embedding_request is not None
         assert gateway.embedding_request["expected_dimension"] == 3
         assert gateway.embedding_request["texts"] == [
-            "名称：银港\n分类：地点\n关键词：银港\n内容：银港终年被海雾笼罩。",
+            "名称：银港\n分类：地点\n关键词：银港、海雾\n内容：银港终年被海雾笼罩。",
             "名称：雾钟\n分类：规则\n关键词：雾钟\n内容：雾钟响起后禁止出港。",
         ]
         assert len(chroma.calls) == 1
@@ -353,10 +365,10 @@ def test_confirm_drafts_commits_sqlite_before_embedding_and_marks_ready(
         assert call["metadatas"] == [
             {
                 "sourceKind": "liveEntry",
-                "entryId": entry.id,
-                "worldBookId": book.id,
-                "enabled": True,
-                "resident": False,
+                    "entryId": entry.id,
+                    "worldBookId": book.id,
+                    "enabled": True,
+                    "resident": entry.resident,
                 "embeddingVersion": 3,
                 "contentHash": session.get(WorldBookEntryModel, entry.id).content_hash,
             }
@@ -389,7 +401,17 @@ def test_confirm_drafts_keeps_entries_when_embedding_fails(tmp_path: Path) -> No
         book = service.create_world_book()
         configure_embedding(session)
         payload = ConfirmWorldBookDraftsPayload.model_validate(
-            {"drafts": [{"name": "银港", "category": "地点", "content": "原文事实"}]}
+            {
+                "drafts": [
+                    {
+                        "name": "银港",
+                        "category": "地点",
+                        "keywords": ["银港"],
+                        "resident": False,
+                        "content": "原文事实",
+                    }
+                ]
+            }
         )
 
         entries = asyncio.run(service.confirm_drafts(book.id, payload))
@@ -419,7 +441,17 @@ def test_confirm_drafts_keeps_entries_when_chroma_write_fails(tmp_path: Path) ->
         book = service.create_world_book()
         configure_embedding(session)
         payload = ConfirmWorldBookDraftsPayload.model_validate(
-            {"drafts": [{"name": "银港", "category": "地点", "content": "原文事实"}]}
+            {
+                "drafts": [
+                    {
+                        "name": "银港",
+                        "category": "地点",
+                        "keywords": ["银港"],
+                        "resident": False,
+                        "content": "原文事实",
+                    }
+                ]
+            }
         )
 
         entries = asyncio.run(service.confirm_drafts(book.id, payload))
@@ -456,7 +488,17 @@ def test_confirm_drafts_does_not_write_vector_after_embedding_version_changes(
 
         gateway.on_embed = change_embedding_version
         payload = ConfirmWorldBookDraftsPayload.model_validate(
-            {"drafts": [{"name": "银港", "category": "地点", "content": "原文事实"}]}
+            {
+                "drafts": [
+                    {
+                        "name": "银港",
+                        "category": "地点",
+                        "keywords": ["银港"],
+                        "resident": False,
+                        "content": "原文事实",
+                    }
+                ]
+            }
         )
 
         entries = asyncio.run(service.confirm_drafts(book.id, payload))
@@ -505,7 +547,17 @@ def test_confirm_drafts_does_not_mark_changed_content_ready(tmp_path: Path) -> N
 
         gateway.on_embed = change_entry_content
         payload = ConfirmWorldBookDraftsPayload.model_validate(
-            {"drafts": [{"name": "银港", "category": "地点", "content": "原文事实"}]}
+            {
+                "drafts": [
+                    {
+                        "name": "银港",
+                        "category": "地点",
+                        "keywords": ["银港"],
+                        "resident": False,
+                        "content": "原文事实",
+                    }
+                ]
+            }
         )
 
         entries = asyncio.run(service.confirm_drafts(book.id, payload))
@@ -535,7 +587,17 @@ def test_confirm_drafts_writes_real_chroma_collection(tmp_path: Path) -> None:
         book = service.create_world_book()
         configure_embedding(session, version=3)
         payload = ConfirmWorldBookDraftsPayload.model_validate(
-            {"drafts": [{"name": "银港", "category": "地点", "content": "原文事实"}]}
+            {
+                "drafts": [
+                    {
+                        "name": "银港",
+                        "category": "地点",
+                        "keywords": ["银港"],
+                        "resident": False,
+                        "content": "原文事实",
+                    }
+                ]
+            }
         )
 
         entries = asyncio.run(service.confirm_drafts(book.id, payload))

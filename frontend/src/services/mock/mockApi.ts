@@ -289,6 +289,8 @@ export const mockApi: ApiClient = {
     const drafts: WorldBookDraftEntry[] = paragraphs.slice(0, 6).map((p) => ({
       name: p.slice(0, 6).replace(/[，。：、,.:].*$/, '') || '未命名',
       category: '待分类',
+      keywords: [p.slice(0, 6).replace(/[，。：、,.:].*$/, '') || '未命名'],
+      resident: false,
       content: p,
     }));
     return delay(drafts, 700);
@@ -302,8 +304,8 @@ export const mockApi: ApiClient = {
       name: d.name,
       content: d.content,
       category: d.category,
-      keywords: [d.name],
-      resident: false,
+      keywords: d.keywords,
+      resident: d.resident,
       enabled: true,
     }));
     book!.entries = [...book!.entries, ...created];
@@ -513,8 +515,8 @@ export const mockApi: ApiClient = {
 };
 
 /* ── 流式回复 ─────────────────────────────────────────────
-   复用设计稿的三条预设剧本，按内容块逐字吐出，
-   让 ChatPage 真实走一遍 SSE 渲染路径。 */
+   复用设计稿的三条预设剧本，按完整内容块依次吐出，
+   让 ChatPage 走一遍与真实后端一致的块级 SSE 渲染路径。 */
 
 export async function mockStreamChat(
   sessionId: string,
@@ -555,14 +557,10 @@ export async function mockStreamChat(
     if (aborted()) return;
     const block = reply.blocks[i];
     onEvent({ type: 'block_start', sequence: i, blockType: block.t });
-    // 每次吐 2 个字符，模拟 token 级流式
-    for (let p = 0; p < block.text.length; p += 2) {
-      await sleep(24);
-      if (aborted()) return;
-      onEvent({ type: 'block_delta', sequence: i, text: block.text.slice(p, p + 2) });
-    }
-    onEvent({ type: 'block_end', sequence: i });
     await sleep(160);
+    if (aborted()) return;
+    onEvent({ type: 'block_delta', sequence: i, text: block.text });
+    onEvent({ type: 'block_end', sequence: i });
   }
 
   if (aborted()) return;

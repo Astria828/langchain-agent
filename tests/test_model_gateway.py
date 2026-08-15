@@ -9,8 +9,18 @@ from app.core.exceptions import AppError
 from app.gateways.model_gateway import ModelGateway, normalize_base_url
 
 
+def stream_response(*contents: str) -> httpx.Response:
+    """构造 OpenAI-compatible SSE 测试响应。"""
+
+    frames = [
+        f"data: {json.dumps({'choices': [{'delta': {'content': content}}]}, ensure_ascii=False)}\n\n"
+        for content in contents
+    ]
+    return httpx.Response(200, text="".join([*frames, "data: [DONE]\n\n"]))
+
+
 def test_main_connection_uses_openai_compatible_contract() -> None:
-    """主模型测试发送最小聊天请求和 Bearer 凭据。"""
+    """主模型测试发送最小流式聊天请求和 Bearer 凭据。"""
 
     captured: dict[str, object] = {}
 
@@ -18,7 +28,7 @@ def test_main_connection_uses_openai_compatible_contract() -> None:
         captured["path"] = request.url.path
         captured["authorization"] = request.headers["Authorization"]
         captured["payload"] = json.loads(request.content)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+        return stream_response("ok")
 
     gateway = ModelGateway(transport=httpx.MockTransport(handler))
     asyncio.run(
@@ -37,6 +47,7 @@ def test_main_connection_uses_openai_compatible_contract() -> None:
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 1,
             "temperature": 0,
+            "stream": True,
         },
     }
 
@@ -116,6 +127,44 @@ def test_chat_completion_rejects_missing_message_content() -> None:
     assert error.value.code == "MODEL_OUTPUT_INVALID"
 
 
+def test_chat_completion_stream_returns_only_ordered_content_deltas() -> None:
+    """角色对话忽略角色和 usage 帧，只按顺序交付非空正文增量。"""
+
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        frames = [
+            'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":"前半"}}]}\n\n',
+            'data: {"choices":[]}\n\n',
+            'data: {"choices":[{"delta":{"content":"后半"}}]}\n\n',
+            "data: [DONE]\n\n",
+        ]
+        return httpx.Response(200, text="".join(frames))
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+
+    async def collect() -> list[str]:
+        return [
+            chunk
+            async for chunk in gateway.stream_chat_completion(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test-main",
+                messages=[{"role": "user", "content": "你好"}],
+            )
+        ]
+
+    assert asyncio.run(collect()) == ["前半", "后半"]
+    assert captured["payload"] == {
+        "model": "chat-model",
+        "messages": [{"role": "user", "content": "你好"}],
+        "temperature": 0,
+        "stream": True,
+    }
+
+
 def test_embedding_batch_uses_openai_contract_and_validates_dimension() -> None:
     """重建调用一次提交文本数组，并校验每条向量与配置维度一致。"""
 
@@ -182,7 +231,7 @@ def test_transient_upstream_status_is_retried_once() -> None:
         attempts += 1
         if attempts == 1:
             return httpx.Response(503, text="temporary")
-        return httpx.Response(200, json={"choices": [{}]})
+        return stream_response("ok")
 
     gateway = ModelGateway(transport=httpx.MockTransport(handler))
     asyncio.run(

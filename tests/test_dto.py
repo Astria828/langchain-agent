@@ -147,17 +147,42 @@ def test_world_book_draft_confirmation_requires_valid_non_empty_drafts() -> None
                 {
                     "name": "  银港  ",
                     "category": "地点",
+                    "keywords": [" 银港 ", "海雾", "银港"],
+                    "resident": True,
                     "content": "  海雾终年不散。  ",
                 }
             ]
         }
     )
     assert confirmed.drafts[0].name == "银港"
+    assert confirmed.drafts[0].keywords == ["银港", "海雾"]
+    assert confirmed.drafts[0].resident is True
     assert confirmed.drafts[0].content == "海雾终年不散。"
 
     for payload in (
         {"drafts": []},
-        {"drafts": [{"name": "", "category": "地点", "content": "内容"}]},
+        {
+            "drafts": [
+                {
+                    "name": "",
+                    "category": "地点",
+                    "keywords": ["地点"],
+                    "resident": False,
+                    "content": "内容",
+                }
+            ]
+        },
+        {
+            "drafts": [
+                {
+                    "name": "银港",
+                    "category": "地点",
+                    "keywords": [" "],
+                    "resident": False,
+                    "content": "内容",
+                }
+            ]
+        },
     ):
         with pytest.raises(ValidationError):
             ConfirmWorldBookDraftsPayload.model_validate(payload)

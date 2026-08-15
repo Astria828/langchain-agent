@@ -26,7 +26,10 @@ class StubGateway:
     async def create_chat_completion(self, **_kwargs) -> str:
         """返回符合结构化契约的单条草稿。"""
 
-        return '{"drafts":[{"name":"银港","category":"地点","content":"银港被海雾笼罩。"}]}'
+        return (
+            '{"drafts":[{"name":"银港","category":"地点",'
+            '"keywords":["银港","海雾"],"resident":true,"content":"银港被海雾笼罩。"}]}'
+        )
 
     async def create_embeddings(self, **kwargs) -> list[list[float]]:
         """为每段索引文本返回三维测试向量。"""
@@ -172,7 +175,13 @@ def test_worldbook_split_and_confirm_only_persist_after_confirmation(
         assert split.status_code == 200
         drafts = split.json()["data"]
         assert drafts == [
-            {"name": "银港", "category": "地点", "content": "银港被海雾笼罩。"}
+            {
+                "name": "银港",
+                "category": "地点",
+                "keywords": ["银港", "海雾"],
+                "resident": True,
+                "content": "银港被海雾笼罩。",
+            }
         ]
         assert client.get("/api/worldbooks").json()["data"][0]["entries"] == []
         assert chroma.upserts == []

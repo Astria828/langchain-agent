@@ -177,9 +177,21 @@ class WorldBookDraftEntry(ApiModel):
 
     name: str
     category: str
+    keywords: Annotated[list[str], Field(min_length=1)]
+    resident: bool
     content: str
 
     _validate_required_text = field_validator("name", "content")(_non_blank)
+
+    @field_validator("keywords")
+    @classmethod
+    def normalize_keywords(cls, values: list[str]) -> list[str]:
+        """草稿必须保留至少一个可用于精确召回的有效关键词。"""
+
+        normalized = _normalized_keywords(values)
+        if not normalized:
+            raise ValueError("世界书草稿至少需要一个有效关键词")
+        return normalized
 
 
 class ConfirmWorldBookDraftsPayload(ApiModel):

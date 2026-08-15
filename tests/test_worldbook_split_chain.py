@@ -25,7 +25,8 @@ def test_split_chain_returns_validated_drafts_without_rewriting_source() -> None
     """Chain 将原文作为用户数据传递，并校验结构化草稿。"""
 
     gateway = StubGateway(
-        '{"drafts":[{"name":"银港","category":"地点","content":"银港终年被海雾笼罩。"}]}'
+        '{"drafts":[{"name":"银港","category":"地点",'
+        '"keywords":["银港","海雾"],"resident":false,"content":"银港终年被海雾笼罩。"}]}'
     )
     chain = build_worldbook_split_chain(
         gateway=gateway,
@@ -37,6 +38,8 @@ def test_split_chain_returns_validated_drafts_without_rewriting_source() -> None
     drafts = asyncio.run(chain.ainvoke("银港终年被海雾笼罩。"))
 
     assert drafts[0].name == "银港"
+    assert drafts[0].keywords == ["银港", "海雾"]
+    assert drafts[0].resident is False
     assert drafts[0].content == "银港终年被海雾笼罩。"
     assert "不得扩写" in gateway.messages[0]["content"]
     assert gateway.messages[1] == {"role": "user", "content": "银港终年被海雾笼罩。"}

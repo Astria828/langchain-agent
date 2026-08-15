@@ -35,12 +35,17 @@ class UnusedGateway:
         raise AssertionError("空世界书不应生成快照向量")
 
     async def create_chat_completion(self, **_kwargs) -> str:
-        """返回两块确定的基础角色回复。"""
+        """返回推荐回复等非流式任务的确定结果。"""
 
         messages = _kwargs["messages"]
         if "用户推荐回复规则" in messages[0]["content"]:
             return '{"content":"我们继续前进吧。"}'
-        return (
+        raise AssertionError("基础角色回复必须使用流式模型调用")
+
+    async def stream_chat_completion(self, **_kwargs):
+        """返回两块确定的基础角色回复。"""
+
+        yield (
             '{"blocks":['
             '{"type":"action","content":"她看向门口。"},'
             '{"type":"dialogue","content":"欢迎回来。"}'
@@ -325,7 +330,9 @@ def test_message_api_streams_and_persists_ordered_role_reply(tmp_path: Path) -> 
             "done",
         ]
         assert events[0]["blockType"] == "action"
+        assert events[1]["text"] == "她看向门口。"
         assert events[3]["blockType"] == "dialogue"
+        assert events[4]["text"] == "欢迎回来。"
         assert events[-1]["roundCount"] == 1
 
         messages = client.get(f"/api/sessions/{created['id']}/messages").json()["data"]

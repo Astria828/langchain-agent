@@ -874,9 +874,3 @@ export const selectRoundsLeft = (s: AppState): number => {
   return 10 - ((session?.roundCount ?? 0) % 10);
 };
 
-/** 输入框下方只展示当前阶段实际注入的基础对话上下文。 */
-export const selectContextHint = (s: AppState): string => {
-  const session = selectCurrentSession(s);
-  const bookPart = session?.worldBookId ? ' · 世界书已绑定（当前不检索）' : '';
-  return `上下文：应用规则 · 身份快照 · 角色卡快照 · 最近 20 轮对话${bookPart}`;
-};

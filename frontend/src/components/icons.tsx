@@ -62,6 +62,26 @@ export function ContinueIcon({ size = 13, stroke = 'currentColor', strokeWidth =
   );
 }
 
+/** 主 API：钢笔 */
+export function PencilIcon({ size = 15, stroke = 'currentColor', strokeWidth = 1.6, style }: IconProps) {
+  return (
+    <svg {...base(size, stroke, strokeWidth, { pointerEvents: 'none', ...style })}>
+      <path d="M4 20h4L19.3 8.7a2.1 2.1 0 0 0 0-3l-1-1a2.1 2.1 0 0 0-3 0L4 16z" />
+      <path d="M14.5 5.7l3.8 3.8" />
+    </svg>
+  );
+}
+
+/** Embedding：放大镜 */
+export function SearchIcon({ size = 15, stroke = 'currentColor', strokeWidth = 1.6, style }: IconProps) {
+  return (
+    <svg {...base(size, stroke, strokeWidth, { pointerEvents: 'none', ...style })}>
+      <circle cx="10.8" cy="10.8" r="6.3" />
+      <path d="M15.4 15.4L20 20" />
+    </svg>
+  );
+}
+
 /**
  * 发送：纸飞机。
  * 机身以 45° 对角线左右对称（尾点与底点关于对角线互为镜像），

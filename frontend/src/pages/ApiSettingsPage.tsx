@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 
 import PageHeader from '@/components/PageHeader';
+import { PencilIcon, SearchIcon } from '@/components/icons';
 import { useAppStore } from '@/stores/appStore';
 import type { ModelEndpointConfig, ModelGroup } from '@/types';
 
@@ -15,20 +16,23 @@ import type { ModelEndpointConfig, ModelGroup } from '@/types';
 
 interface GroupDef {
   id: ModelGroup;
-  icon: string;
+  Icon: typeof PencilIcon;
   title: string;
   desc: string;
 }
 
 const GROUPS: GroupDef[] = [
-  { id: 'main', icon: '✎', title: '主 API', desc: '对话生成、世界书拆分、记忆提取与整合' },
+  { id: 'main', Icon: PencilIcon, title: '主 API', desc: '对话生成、世界书拆分、记忆提取与整合' },
   {
     id: 'embed',
-    icon: '⌕',
+    Icon: SearchIcon,
     title: 'Embedding 模型',
     desc: '世界书条目与长期记忆的向量化，供 RAG 语义检索',
   },
 ];
+
+/** 与记忆 / 数据 / 日志三页一致的居中版心，不再单独收窄到 640 */
+const PAGE_MAX_WIDTH = 900;
 
 interface Draft {
   baseUrl: string;
@@ -63,13 +67,13 @@ export default function ApiSettingsPage() {
 
   if (!modelSettings || !drafts) {
     return (
-      <div style={{ height: '100%', overflowY: 'auto', padding: '52px 56px' }}>
-        <div style={{ maxWidth: 640, margin: '0 auto' }}>
+      <div style={{ height: '100%', overflowY: 'auto', padding: '44px clamp(24px,5vw,56px)' }}>
+        <div style={{ maxWidth: PAGE_MAX_WIDTH, margin: '0 auto' }}>
           <PageHeader
             title="API 配置"
             subtitle="主 API 负责对话生成等常规功能；Embedding 模型用于世界书与记忆的向量检索。"
           />
-          <div className="card" style={{ marginTop: 34, padding: '26px 28px', borderRadius: 16 }}>
+          <div style={{ marginTop: 30 }}>
             <div className={modelSettingsError ? 'note-warn' : 'note-ok'}>
               {modelSettingsLoading
                 ? '正在读取后端模型配置…'
@@ -136,12 +140,14 @@ export default function ApiSettingsPage() {
   };
 
   return (
-    <div style={{ height: '100%', overflowY: 'auto', padding: '52px 56px' }}>
-      <div style={{ maxWidth: 640, margin: '0 auto' }}>
+    <div style={{ height: '100%', overflowY: 'auto', padding: '44px clamp(24px,5vw,56px)' }}>
+      <div style={{ maxWidth: PAGE_MAX_WIDTH, margin: '0 auto' }}>
         <PageHeader
           title="API 配置"
           subtitle="主 API 负责对话生成等常规功能；Embedding 模型用于世界书与记忆的向量检索。"
         />
+
+        <div style={{ height: 12 }} />
 
         {GROUPS.map((g) => (
           <GroupCard
@@ -162,7 +168,16 @@ export default function ApiSettingsPage() {
           />
         ))}
 
-        <div className="note-ok" style={{ marginTop: 26 }}>
+        {/* 去掉描边与底色，降为分隔线上方的一行说明，文字色沿用 note-ok */}
+        <div
+          style={{
+            borderTop: '1px solid rgba(255,214,170,.07)',
+            paddingTop: 18,
+            fontSize: 12,
+            color: '#9dbfa5',
+            lineHeight: 1.7,
+          }}
+        >
           ✦ API Key 加密保存在本地，不会明文回传或写入日志 · 仅连接测试通过后可保存生效
         </div>
         <div style={{ height: 40 }} />
@@ -227,126 +242,118 @@ function GroupCard({
     { key: 'model', label: '模型名称', type: 'text', placeholder: '模型 ID', masked: false },
   ];
 
+  const { Icon } = def;
+
   return (
-    <div
-      className="card"
-      style={{ marginTop: 34, padding: '26px 28px', borderRadius: 16 }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={{ fontSize: 17 }}>{def.icon}</span>
-        <span className="serif" style={{ fontSize: 16.5, fontWeight: 600 }}>
+    <div className="settings-group">
+      {/* 左栏：分组身份与状态 */}
+      <div>
+        <div
+          className="serif"
+          style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 15.5, fontWeight: 600 }}
+        >
+          <Icon stroke="var(--accent-deep)" style={{ flex: 'none' }} />
           {def.title}
-        </span>
-        <span
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--text-dim-2)', marginTop: 8, lineHeight: 1.7 }}>
+          {def.desc}
+        </div>
+        <div className="settings-status" style={{ color: green ? 'var(--ok)' : 'var(--warn)' }}>
+          {status}
+        </div>
+      </div>
+
+      {/* 右栏：字段与操作 */}
+      <div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {fields.map((f) => (
+            <div key={f.key}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                <span className="label-section">{f.label}</span>
+                {f.masked && (
+                  <span style={{ fontSize: 11, color: 'var(--ok)', whiteSpace: 'nowrap' }}>
+                    已配置 · ••••{saved.keyTail}
+                  </span>
+                )}
+              </div>
+              <input
+                className="input input--deep input--flat"
+                type={f.type}
+                value={draft[f.key]}
+                onChange={(e) => onField(f.key, e.target.value)}
+                placeholder={f.placeholder}
+                style={{ padding: '12px 16px', lineHeight: 'normal' }}
+              />
+            </div>
+          ))}
+        </div>
+
+        <div
           style={{
-            fontSize: 11,
-            color: green ? 'var(--ok)' : 'var(--warn)',
-            padding: '3px 11px',
-            borderRadius: 12,
-            background: green ? 'rgba(143,214,160,.08)' : 'rgba(224,185,106,.08)',
-            border: `1px solid ${green ? 'rgba(143,214,160,.2)' : 'rgba(224,185,106,.25)'}`,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            flexWrap: 'wrap',
+            marginTop: 20,
           }}
         >
-          ● {status}
-        </span>
-      </div>
-      <div style={{ fontSize: 12, color: 'var(--text-dim-2)', marginTop: 7, lineHeight: 1.6 }}>
-        {def.desc}
-      </div>
-
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 18, marginTop: 22 }}>
-        {fields.map((f) => (
-          <div key={f.key}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-              <span className="label-section">{f.label}</span>
-              {f.masked && (
-                <span
-                  style={{
-                    fontSize: 11,
-                    color: 'var(--ok)',
-                    padding: '2px 9px',
-                    borderRadius: 10,
-                    background: 'rgba(143,214,160,.08)',
-                    border: '1px solid rgba(143,214,160,.2)',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  已配置 · ••••{saved.keyTail}
-                </span>
-              )}
-            </div>
-            <input
-              className="input input--deep"
-              type={f.type}
-              value={draft[f.key]}
-              onChange={(e) => onField(f.key, e.target.value)}
-              placeholder={f.placeholder}
-              style={{ padding: '12px 16px', lineHeight: 'normal' }}
-            />
-          </div>
-        ))}
-      </div>
-
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 10,
-          flexWrap: 'wrap',
-          marginTop: 20,
-        }}
-      >
-        <button
-          className="btn-ghost"
-          onClick={onTest}
-          disabled={actionLocked}
-          style={{ fontSize: 12.5, padding: '9px 18px' }}
-        >
-          {testing ? '正在测试…' : '测试连接'}
-        </button>
-        <button
-          className="btn-primary"
-          onClick={onSave}
-          disabled={!canSave || actionLocked}
-          style={{ fontSize: 12.5, padding: '9px 20px' }}
-        >
-          {saving ? '正在保存…' : '保存并生效'}
-        </button>
-        <span style={{ fontSize: 11.5, color: 'var(--text-dim-3)', lineHeight: 1.6 }}>
-          {!dirty ? '当前配置已生效' : tested ? '连接测试已通过，可保存生效' : '需先通过连接测试才能保存'}
-        </span>
-      </div>
-
-      {showRebuild && (
-        <div className="note-warn" style={{ marginTop: 16 }}>
-          <div style={{ fontSize: 12.5, color: 'var(--warn)', lineHeight: 1.7, fontWeight: 600 }}>
-            ⚠ Embedding 模型或向量维度已变更
-          </div>
-          <div style={{ fontSize: 12, color: 'var(--accent-pale)', lineHeight: 1.7, marginTop: 6 }}>
-            必须重建世界书与长期记忆索引，重建完成前不会使用旧向量检索。
-          </div>
           <button
-            onClick={onRebuild}
+            className="btn-ghost"
+            onClick={onTest}
             disabled={actionLocked}
-            style={{
-              marginTop: 12,
-              fontSize: 12.5,
-              fontWeight: 600,
-              color: 'var(--on-accent)',
-              background: 'linear-gradient(135deg,#e0b96a,#e2704e)',
-              border: 'none',
-              padding: '9px 18px',
-              borderRadius: 20,
-              cursor: actionLocked ? 'not-allowed' : 'pointer',
-              opacity: actionLocked ? 0.65 : 1,
-              fontFamily: 'inherit',
-              whiteSpace: 'nowrap',
-            }}
+            style={{ fontSize: 12.5, padding: '9px 18px' }}
           >
-            {rebuilding ? '正在重建索引…' : '立即重建索引'}
+            {testing ? '正在测试…' : '测试连接'}
           </button>
+          <button
+            className="btn-primary"
+            onClick={onSave}
+            disabled={!canSave || actionLocked}
+            style={{ fontSize: 12.5, padding: '9px 20px' }}
+          >
+            {saving ? '正在保存…' : '保存并生效'}
+          </button>
+          {/* 已生效时左栏状态点已说明一切，这里不再重复 */}
+          {dirty && (
+            <span style={{ fontSize: 11.5, color: 'var(--text-dim-3)', lineHeight: 1.6 }}>
+              {tested ? '连接测试已通过，可保存生效' : '需先通过连接测试才能保存'}
+            </span>
+          )}
         </div>
-      )}
+
+        {showRebuild && (
+          <div className="note-warn" style={{ marginTop: 16 }}>
+            <div style={{ fontSize: 12.5, color: 'var(--warn)', lineHeight: 1.7, fontWeight: 600 }}>
+              ⚠ Embedding 模型或向量维度已变更
+            </div>
+            <div
+              style={{ fontSize: 12, color: 'var(--accent-pale)', lineHeight: 1.7, marginTop: 6 }}
+            >
+              必须重建世界书与长期记忆索引，重建完成前不会使用旧向量检索。
+            </div>
+            <button
+              onClick={onRebuild}
+              disabled={actionLocked}
+              style={{
+                marginTop: 12,
+                fontSize: 12.5,
+                fontWeight: 600,
+                color: 'var(--on-accent)',
+                background: 'linear-gradient(135deg,#e0b96a,#e2704e)',
+                border: 'none',
+                padding: '9px 18px',
+                borderRadius: 20,
+                cursor: actionLocked ? 'not-allowed' : 'pointer',
+                opacity: actionLocked ? 0.65 : 1,
+                fontFamily: 'inherit',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {rebuilding ? '正在重建索引…' : '立即重建索引'}
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

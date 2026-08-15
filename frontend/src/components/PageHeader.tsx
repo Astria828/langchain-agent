@@ -10,14 +10,13 @@ interface Props {
   title: string;
   subtitle: string;
   actions?: ReactNode;
-  titleSize?: number;
 }
 
-export default function PageHeader({ title, subtitle, actions, titleSize = 26 }: Props) {
+export default function PageHeader({ title, subtitle, actions }: Props) {
   if (!actions) {
     return (
       <>
-        <div className="serif" style={{ fontSize: titleSize, fontWeight: 600 }}>
+        <div className="serif" style={{ fontSize: 26, fontWeight: 600 }}>
           {title}
         </div>
         <div className="page-sub">{subtitle}</div>
@@ -36,7 +35,7 @@ export default function PageHeader({ title, subtitle, actions, titleSize = 26 }:
       }}
     >
       <div>
-        <div className="serif" style={{ fontSize: titleSize, fontWeight: 600 }}>
+        <div className="serif" style={{ fontSize: 26, fontWeight: 600 }}>
           {title}
         </div>
         <div className="page-sub">{subtitle}</div>

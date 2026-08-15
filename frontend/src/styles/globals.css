@@ -625,6 +625,42 @@ button:disabled {
   border-bottom-color: rgba(240, 163, 94, 0.4);
 }
 
+/* ── 设置页分组（API 配置） ──────────────────────────────
+   左栏放分组身份与状态，右栏放字段，横向铺开取代居中窄栏卡片。 */
+
+.settings-group {
+  display: grid;
+  grid-template-columns: 170px minmax(0, 1fr);
+  gap: 30px;
+  padding: 26px 0;
+  border-top: 1px solid rgba(255, 214, 170, 0.07);
+}
+
+/* 窄屏退回单栏，左栏内容顺势变成字段组的小标题 */
+@media (max-width: 760px) {
+  .settings-group {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 18px;
+  }
+}
+
+/* 分组状态：圆点 + 文字，取代描边胶囊；颜色由调用处按语义给 */
+.settings-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 11.5px;
+}
+.settings-status::before {
+  content: '';
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 /* ── 卡片 ─────────────────────────────────────────────── */
 
 .card {
@@ -682,8 +718,16 @@ button:disabled {
 .textarea--deep {
   background: var(--surface-deep);
 }
-.textarea--soft:focus {
-  border-color: rgba(240, 163, 94, 0.4);
+
+/* 无描边填充输入（API 配置字段）。保留 .input 的 1px 边框盒子只是把它透明化，
+   聚焦时用 inset 阴影补回边界，尺寸始终不变。
+   必须排在 .input:focus 之后，同特异度靠源码顺序取胜。 */
+.input--flat,
+.input--flat:focus {
+  border-color: transparent;
+}
+.input--flat:focus {
+  box-shadow: inset 0 0 0 1px var(--line-accent-on);
 }
 
 /* 下划线式标题输入 */
@@ -700,19 +744,6 @@ button:disabled {
 }
 .input-underline:focus {
   border-bottom-color: var(--line-accent-on);
-}
-
-/* 下划线式普通输入（关键词行） */
-.input-underline-soft {
-  background: transparent;
-  border: none;
-  border-bottom: 1px solid var(--line-2);
-  color: var(--text-mute);
-  font-family: inherit;
-  transition: border-bottom-color 0.15s;
-}
-.input-underline-soft:focus {
-  border-bottom-color: rgba(240, 163, 94, 0.4);
 }
 
 /* 无边框输入（角色 tagline） */

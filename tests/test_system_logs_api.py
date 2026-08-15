@@ -83,13 +83,11 @@ def test_logs_api_filters_downloads_and_partially_deletes_on_windows(
         with TestClient(application) as client:
             health_response = client.get("/api/health")
             health_request_id = health_response.headers["X-Request-ID"]
+            assert health_request_id.startswith("req_")
             _flush_application_logs()
             request_entries = client.get("/api/logs?level=INFO&range=1d").json()["data"]
-            assert any(
-                entry["event"] == "http_request_completed"
-                and entry["requestId"] == health_request_id
-                and entry["businessIds"]["path"] == "/api/health"
-                for entry in request_entries
+            assert all(
+                entry["event"] != "http_request_completed" for entry in request_entries
             )
 
             error_response = client.get("/api/logs?level=ERROR&range=1d")

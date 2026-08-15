@@ -4,7 +4,6 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from time import perf_counter
 from typing import Literal
 from uuid import uuid4
 
@@ -99,27 +98,14 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
 
     @application.middleware("http")
     async def request_id_middleware(request: Request, call_next):
-        """为请求绑定链路 ID，并记录不含正文和查询参数的完成事件。"""
+        """为请求绑定链路 ID；成功请求不写日志，失败请求保留定位事件。"""
 
         request_id = f"req_{uuid4().hex}"
         request.state.request_id = request_id
         token = bind_request_id(request_id)
-        started_at = perf_counter()
         try:
             response = await call_next(request)
             response.headers["X-Request-ID"] = request_id
-            logger.info(
-                "HTTP 请求处理完成",
-                extra={
-                    "event": "http_request_completed",
-                    "business_ids": {
-                        "method": request.method,
-                        "path": request.url.path,
-                        "statusCode": response.status_code,
-                        "durationMs": round((perf_counter() - started_at) * 1000),
-                    },
-                },
-            )
             return response
         except Exception:
             logger.exception(

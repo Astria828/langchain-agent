@@ -36,7 +36,15 @@ Set-Location -LiteralPath '..'
 
 ## 3. 启动
 
-终端一：
+推荐直接双击项目根目录的 `start.cmd`。启动器会依次升级数据库、启动后端和前端、等待健康检查通过，然后自动打开 `http://localhost:5173`。
+
+运行期间保留启动器窗口即可；按 `Ctrl+C` 或关闭该窗口会同时停止前后端。也可以在项目根目录通过 PowerShell 启动：
+
+```powershell
+.\scripts\start.ps1
+```
+
+需要分别调试进程时，仍可手动启动。终端一：
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000

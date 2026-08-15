@@ -24,7 +24,7 @@ from app.schemas.dto import (
     UpdateWorldBookEntryPayload,
     UpdateWorldBookPayload,
 )
-from app.services.worldbook_service import WorldBookService
+from app.services.worldbook_service import WorldBookService, strip_duplicate_keyword_line
 from sqlalchemy import func, select
 
 from scripts.init_db import initialize_database
@@ -738,3 +738,40 @@ def test_delete_world_book_records_cleanup_tasks_when_chroma_fails(
     finally:
         session.close()
         engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("content", "keywords", "expected"),
+    [
+        # 逐字重复的整行被剥离，正文从空行之后开始
+        (
+            "触发关键词：世界、大陆\n\n这是一个魔法世界。",
+            ["世界", "大陆"],
+            "这是一个魔法世界。",
+        ),
+        # 多个空行一并吃掉
+        ("触发关键词：禁区\n\n\n城墙以北。", ["禁区"], "城墙以北。"),
+        # 关键词顺序与字段不一致时不动，避免误伤用户改过的正文
+        (
+            "触发关键词：大陆、世界\n\n正文。",
+            ["世界", "大陆"],
+            "触发关键词：大陆、世界\n\n正文。",
+        ),
+        # 关键词只是正文首词的前缀，不构成独立一行
+        (
+            "触发关键词：世界观是这样的。",
+            ["世界"],
+            "触发关键词：世界观是这样的。",
+        ),
+        # 剥离后正文为空则保持原样，不留空条目
+        ("触发关键词：世界\n\n", ["世界"], "触发关键词：世界\n\n"),
+        # 没有该行的正文原样返回
+        ("普通正文。", ["世界"], "普通正文。"),
+    ],
+)
+def test_strip_duplicate_keyword_line(
+    content: str,
+    keywords: list[str],
+    expected: str,
+) -> None:
+    assert strip_duplicate_keyword_line(content, keywords) == expected

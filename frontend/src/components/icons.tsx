@@ -42,6 +42,51 @@ export function TrashIcon({ size = 15, stroke = 'currentColor', strokeWidth = 1.
   );
 }
 
+/** 重说：回环箭头 */
+export function RegenerateIcon({ size = 13, stroke = 'currentColor', strokeWidth = 1.5, style }: IconProps) {
+  return (
+    <svg {...base(size, stroke, strokeWidth, { pointerEvents: 'none', ...style })}>
+      <path d="M20 12a8 8 0 1 1-2.34-5.66L20 8.6" />
+      <path d="M20 3.8v4.8h-4.8" />
+    </svg>
+  );
+}
+
+/** 继续说：细长右箭头 */
+export function ContinueIcon({ size = 13, stroke = 'currentColor', strokeWidth = 1.5, style }: IconProps) {
+  return (
+    <svg {...base(size, stroke, strokeWidth, { pointerEvents: 'none', ...style })}>
+      <path d="M4 12h15" />
+      <path d="M13.4 6.6L18.8 12l-5.4 5.4" />
+    </svg>
+  );
+}
+
+/**
+ * 发送：纸飞机。
+ * 机身以 45° 对角线左右对称（尾点与底点关于对角线互为镜像），
+ * 折线顶点落在「机头 → 尾底中点」的连线上，收在 83% 处形成尖窄的尾凹。
+ * 转角圆滑交给 strokeLinejoin: round，不额外画圆弧。
+ */
+export function SendIcon({ size = 19, stroke = 'currentColor', strokeWidth = 1.8, style }: IconProps) {
+  return (
+    <svg {...base(size, stroke, strokeWidth, { pointerEvents: 'none', ...style })}>
+      <path d="M21 3L3.2 10.3l7.4 3.1 3.1 7.4z" />
+      <path d="M21 3l-10.4 10.4" />
+    </svg>
+  );
+}
+
+/** 推荐回复：四角星芒 */
+export function SparkIcon({ size = 14, stroke = 'currentColor', strokeWidth = 1.5, style }: IconProps) {
+  return (
+    <svg {...base(size, stroke, strokeWidth, { pointerEvents: 'none', ...style })}>
+      <path d="M11 3.4l1.75 4.85L17.6 10l-4.85 1.75L11 16.6l-1.75-4.85L4.4 10l4.85-1.75z" />
+      <path d="M17.8 14.6l.75 2.05 2.05.75-2.05.75-.75 2.05-.75-2.05-2.05-.75 2.05-.75z" />
+    </svg>
+  );
+}
+
 /** 折叠/展开对话列表 */
 export function PanelIcon({ size = 20, stroke = 'currentColor', strokeWidth = 1.6, style }: IconProps) {
   return (

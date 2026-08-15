@@ -34,6 +34,29 @@ logger = logging.getLogger(__name__)
 
 IndexSourceState = tuple[str, bool, bool]
 
+KEYWORD_LINE_PREFIX = "触发关键词："
+
+
+def strip_duplicate_keyword_line(content: str, keywords: list[str]) -> str:
+    """剥离正文开头与 keywords 字段逐字重复的「触发关键词：」行。
+
+    该行来自世界书原文，信息已完整提取进 keywords 字段（PRD §3.3 要求提取为
+    结构化字段），继续留在正文里只会和界面下方的关键词框重复展示。
+
+    只在整行与 `'、'.join(keywords)` 逐字相符、且其后紧跟换行时才剥离；
+    关键词是正文首词的前缀这类情况（关键词「世界」撞上正文「世界观…」）保持原样，
+    正文被剥空时也保持原样，避免误删用户设定。
+    """
+
+    prefix = f"{KEYWORD_LINE_PREFIX}{'、'.join(keywords)}"
+    if not content.startswith(prefix):
+        return content
+    rest = content[len(prefix) :]
+    if rest and not rest.startswith("\n"):
+        return content
+    body = rest.lstrip("\n")
+    return body or content
+
 
 class WorldBookService:
     """管理世界书业务事实，并为后续索引同步维护准确状态。"""
@@ -153,7 +176,7 @@ class WorldBookService:
                 world_book_id=world_book_id,
                 position=next_position + offset,
                 name=draft.name,
-                content=draft.content,
+                content=strip_duplicate_keyword_line(draft.content, draft.keywords),
                 keywords_json=json.dumps(
                     draft.keywords,
                     ensure_ascii=False,

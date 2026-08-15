@@ -1,12 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 
-import ConfirmInline from '@/components/ConfirmInline';
 import MessageBlocks from '@/components/MessageBlocks';
 import ResizableDivider, { useResizablePanel } from '@/components/ResizableDivider';
 import SessionList from '@/components/SessionList';
-import { PanelIcon } from '@/components/icons';
 import {
-  selectContextHint,
+  ContinueIcon,
+  PanelIcon,
+  RegenerateIcon,
+  SendIcon,
+  SparkIcon,
+  TrashIcon,
+} from '@/components/icons';
+import {
   selectCurrentCharacter,
   selectCurrentSession,
   selectCurrentWorldBook,
@@ -34,7 +39,6 @@ export default function ChatPage() {
   const session = useAppStore(selectCurrentSession);
   const character = useAppStore(selectCurrentCharacter);
   const worldBook = useAppStore(selectCurrentWorldBook);
-  const contextHint = useAppStore(selectContextHint);
   const messages = useAppStore((s) => s.messages);
   const sessionsLoading = useAppStore((s) => s.sessionsLoading);
   const sessionsError = useAppStore((s) => s.sessionsError);
@@ -269,21 +273,22 @@ export default function ChatPage() {
               boxSizing: 'border-box',
               display: 'flex',
               gap: 12,
-              alignItems: 'flex-end',
-              padding: '14px 16px',
-              borderRadius: 18,
+              // 三者共用同一条水平中线，输入区变高时按钮不会被拖到底部
+              alignItems: 'center',
+              padding: '9px 16px',
+              borderRadius: 14,
               background: hasSession ? 'rgba(36,26,18,.85)' : 'rgba(30,22,15,.5)',
               border: '1px solid var(--line-4)',
               boxShadow: '0 8px 40px rgba(0,0,0,.4)',
             }}
             >
             <button
-              className="btn-ghost"
+              className="compose-action"
               onClick={() => void fillRecommendedReply()}
               disabled={!hasSession || busy || !!draft.trim()}
               title={draft.trim() ? '请先清空输入框' : '生成一句可编辑的用户回复'}
-              style={{ flex: 'none', fontSize: 12, padding: '8px 10px' }}
             >
+              <SparkIcon />
               {recommending ? '生成中…' : '推荐回复'}
             </button>
             <textarea
@@ -297,7 +302,7 @@ export default function ChatPage() {
                 }
               }}
               disabled={!hasSession || busy}
-              placeholder={hasSession ? '以你的身份继续故事…（Enter 发送）' : '请先新建一个对话'}
+              placeholder={hasSession ? '' : '请先新建一个对话'}
               style={{
                 flex: 1,
                 resize: 'none',
@@ -307,7 +312,7 @@ export default function ChatPage() {
                 fontFamily: 'var(--font-serif)',
                 fontSize: 15,
                 lineHeight: 1.7,
-                minHeight: 28,
+                minHeight: 24,
                 maxHeight: 120,
               }}
             />
@@ -316,30 +321,22 @@ export default function ChatPage() {
               disabled={!hasSession || busy}
               style={{
                 flex: 'none',
-                width: 40,
-                height: 40,
-                borderRadius: 12,
+                width: 34,
+                height: 34,
+                borderRadius: 10,
                 border: 'none',
                 background: hasSession ? 'var(--grad-accent)' : 'rgba(255,214,170,.08)',
                 color: hasSession ? 'var(--on-accent)' : 'var(--text-dim-4)',
-                fontSize: 17,
+                display: 'grid',
+                placeItems: 'center',
                 cursor: hasSession && !busy ? 'pointer' : 'not-allowed',
                 boxShadow: hasSession ? '0 0 18px rgba(240,163,94,.35)' : 'none',
               }}
+              title="发送"
             >
-              ↑
+              {/* 纸飞机偏向右上，向左下各让 0.5px 抵消视觉重心 */}
+              <SendIcon style={{ marginRight: 0.5, marginTop: 0.5 }} />
             </button>
-          </div>
-          <div
-            style={{
-              width: '100%',
-              marginTop: 8,
-              fontSize: 11,
-              color: 'var(--text-dim-4)',
-              textAlign: 'center',
-            }}
-          >
-            {contextHint}
           </div>
         </div>
       </div>
@@ -447,43 +444,40 @@ function MessageRow({
           </div>
           <MessageBlocks blocks={message.blocks} chatStyle={chatStyle} streaming={streaming} />
           {actions && (
-            <div style={{ marginTop: 12 }}>
-              {!actions.confirmDelete && (
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                  <button
-                    className="btn-ghost"
-                    onClick={actions.onRegenerate}
-                    disabled={actions.disabled}
-                    style={{ fontSize: 11.5, padding: '6px 10px' }}
-                  >
+            <div style={{ marginTop: 10 }}>
+              {!actions.confirmDelete ? (
+                <div className="act-row">
+                  <button className="act-btn" onClick={actions.onRegenerate} disabled={actions.disabled}>
+                    <RegenerateIcon />
                     {actions.pendingAction === 'regenerate' ? '正在重说…' : '重说'}
                   </button>
-                  <button
-                    className="btn-ghost"
-                    onClick={actions.onContinue}
-                    disabled={actions.disabled}
-                    style={{ fontSize: 11.5, padding: '6px 10px' }}
-                  >
+                  <span className="act-sep" />
+                  <button className="act-btn" onClick={actions.onContinue} disabled={actions.disabled}>
+                    <ContinueIcon />
                     {actions.pendingAction === 'continue' ? '正在继续…' : '继续说'}
                   </button>
+                  <span className="act-sep" />
                   <button
-                    className="btn-cancel"
+                    className="act-btn act-btn--danger"
                     onClick={actions.onDeleteRequest}
                     disabled={actions.disabled}
-                    style={{ fontSize: 11.5, padding: '6px 10px' }}
                   >
+                    <TrashIcon size={13} strokeWidth={1.5} />
                     删除本轮
                   </button>
                 </div>
-              )}
-              {actions.confirmDelete && (
-                <ConfirmInline
-                  layout="inline"
-                  text="该轮用户消息和角色回复将被永久删除。"
-                  onConfirm={actions.onDeleteConfirm}
-                  onCancel={actions.onDeleteCancel}
-                  style={{ marginTop: 4 }}
-                />
+              ) : (
+                // 就地降级为一行文字确认，避免弹出整块卡片造成布局跳动
+                <div className="act-row">
+                  <span className="act-note">删除本轮？用户消息与角色回复将一并永久删除。</span>
+                  <button className="act-btn act-btn--confirm" onClick={actions.onDeleteConfirm}>
+                    确认删除
+                  </button>
+                  <span className="act-sep" />
+                  <button className="act-btn" onClick={actions.onDeleteCancel}>
+                    取消
+                  </button>
+                </div>
               )}
             </div>
           )}

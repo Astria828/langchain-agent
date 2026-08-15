@@ -370,6 +370,101 @@ button:disabled {
   background: rgba(240, 163, 94, 0.09);
 }
 
+/* ── 轮次操作行（重说 / 继续说 / 删除本轮） ──────────────
+   次级操作紧贴叙事正文，去掉描边与实底，靠「文字 + 竖细分隔线」成组，
+   hover 才浮出一层比底色略浅的暖色渐变。
+   静止态与 hover 态用同结构的渐变，颜色才能平滑过渡（transparent 与
+   gradient 之间不可插值，会硬切）。 */
+
+.act-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  margin-left: -8px;
+}
+
+.act-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 7px;
+  background: linear-gradient(180deg, rgba(255, 214, 170, 0), rgba(255, 214, 170, 0));
+  color: var(--accent-soft);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s, background 0.16s ease;
+}
+.act-btn:hover:not(:disabled) {
+  color: var(--accent-bright);
+  background: linear-gradient(180deg, rgba(255, 214, 170, 0.075), rgba(255, 214, 170, 0.025));
+}
+.act-btn:disabled {
+  color: var(--text-dim-3);
+}
+
+/* 删除本轮：静止态与其余两项同权重，hover 才转危险色 */
+.act-btn--danger:hover:not(:disabled) {
+  color: var(--danger-text);
+  background: linear-gradient(180deg, rgba(226, 112, 78, 0.1), rgba(226, 112, 78, 0.035));
+}
+
+/* 删除确认里的「确认删除」，静止态即为危险色 */
+.act-btn--confirm {
+  color: var(--danger-text);
+}
+.act-btn--confirm:hover:not(:disabled) {
+  color: #e2a596;
+  background: linear-gradient(180deg, rgba(226, 112, 78, 0.12), rgba(226, 112, 78, 0.04));
+}
+
+.act-note {
+  margin: 0 6px 0 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--danger-text);
+}
+
+/* 纯装饰分隔线，不承载信息，无需满足对比度下限 */
+.act-sep {
+  flex: none;
+  width: 1px;
+  height: 10px;
+  background: rgba(255, 214, 170, 0.12);
+}
+
+/* 输入框内的「推荐回复」：与输入区融为一体，靠一条竖线分隔 */
+.compose-action {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  flex: none;
+  gap: 6px;
+  padding: 4px 12px 4px 2px;
+  border: none;
+  border-right: 1px solid rgba(255, 214, 170, 0.1);
+  background: transparent;
+  color: var(--accent-soft);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.compose-action:hover:not(:disabled) {
+  color: var(--accent-bright);
+}
+.compose-action:disabled {
+  color: var(--text-dim-3);
+  border-right-color: rgba(255, 214, 170, 0.06);
+}
+
 /* ── 筛选胶囊 ─────────────────────────────────────────── */
 
 .chip {
@@ -397,6 +492,137 @@ button:disabled {
   border-color: var(--line-accent-on);
   background: rgba(240, 163, 94, 0.12);
   color: var(--accent-bright);
+}
+
+/* ── 世界书条目（辞书式词条，非卡片） ────────────────────
+   静止态不画任何描边与底色，层级交给排版和留白；
+   编辑面只在 focus 时浮出，且位置提前用 padding 占好，浮出时零布局跳动。 */
+
+.entry-row {
+  padding: 18px 0 20px 18px;
+  border-left: 2px solid transparent;
+  border-bottom: 1px solid rgba(255, 214, 170, 0.07);
+  transition: border-left-color 0.16s ease;
+}
+.entry-row:last-child {
+  border-bottom: none;
+}
+/* 竖线只在编辑该条目时出现，划过不亮，避免鼠标扫过列表时满屏闪烁 */
+.entry-row:focus-within {
+  border-left-color: var(--line-accent-on);
+}
+
+/* 条目名：静止无下划线，hover / focus 才浮出 */
+.entry-name {
+  flex: 1 1 130px;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid transparent;
+  color: var(--text);
+  font-family: var(--font-serif);
+  font-size: 15px;
+  font-weight: 600;
+  transition: border-bottom-color 0.15s;
+}
+.entry-name:hover {
+  border-bottom-color: var(--line-3);
+}
+.entry-name:focus {
+  border-bottom-color: var(--line-accent-on);
+}
+
+/* 常驻标记：去掉描边，开关状态只用颜色表达 */
+.entry-flag {
+  flex: none;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.entry-flag:hover {
+  color: var(--accent-soft);
+}
+.entry-flag--on {
+  color: var(--accent-deep);
+}
+
+/* 索引过期标记，收进标题行 */
+.entry-stale {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  font-size: 11.5px;
+  color: var(--warn);
+  white-space: nowrap;
+}
+.entry-stale::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* 内容区：条目里唯一的面。外层卡片已去掉，所以这里不构成套层，
+   反而是靠这一层把「内容」从留白里立出来，避免整页失焦。
+   静止 / hover / focus 三档同色系递进，只有明度在走，块的几何始终不变。 */
+.entry-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  margin: 9px 0 0;
+  padding: 11px 14px;
+  background: rgba(255, 214, 170, 0.035);
+  border: none;
+  border-radius: 0;
+  color: var(--text-soft);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.85;
+  transition: background 0.16s ease;
+}
+.entry-text:hover {
+  background: rgba(255, 214, 170, 0.055);
+}
+.entry-text:focus {
+  background: rgba(255, 214, 170, 0.075);
+}
+
+.entry-label {
+  flex: none;
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  color: var(--text-dim-2);
+}
+
+.entry-keywords {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 3px 0;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid transparent;
+  color: var(--text-soft);
+  font-family: inherit;
+  font-size: 12px;
+  transition: border-bottom-color 0.15s;
+}
+.entry-keywords:hover {
+  border-bottom-color: var(--line-2);
+}
+.entry-keywords:focus {
+  border-bottom-color: rgba(240, 163, 94, 0.4);
 }
 
 /* ── 卡片 ─────────────────────────────────────────────── */

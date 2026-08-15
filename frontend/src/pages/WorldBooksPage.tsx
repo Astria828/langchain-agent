@@ -197,22 +197,6 @@ export default function WorldBooksPage() {
             </div>
           ))}
         </div>
-
-        <div
-          style={{
-            marginTop: 22,
-            padding: 14,
-            borderRadius: 12,
-            background: 'rgba(240,163,94,.05)',
-            border: '1px solid rgba(240,163,94,.12)',
-            fontSize: 11.5,
-            color: 'var(--text-dim)',
-            lineHeight: 1.7,
-          }}
-        >
-          每轮召回：常驻条目 → 关键词匹配 → 向量检索 Top 3 → 去重过滤后注入 Prompt。世界书与长期记忆使用独立
-          Collection。
-        </div>
       </div>
 
       <ResizableDivider
@@ -517,42 +501,29 @@ export default function WorldBooksPage() {
               </div>
             )}
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div>
               {book.entries.map((entry) => (
                 <div
                   key={entry.id}
-                  className="card"
-                  style={{ padding: '20px 22px', opacity: entry.enabled ? 1 : 0.45 }}
+                  className="entry-row"
+                  style={{ opacity: entry.enabled ? 1 : 0.45 }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
                     <input
-                      className="input-underline"
+                      className="entry-name"
                       value={entry.name}
                       onChange={(e) => draftEntry(book.id, entry.id, { name: e.target.value })}
                       onBlur={(e) => void patchEntry(book.id, entry.id, { name: e.target.value })}
                       placeholder="条目名称"
-                      style={{ flex: '1 1 130px', minWidth: 0, fontSize: 15.5, padding: '3px 2px' }}
                     />
                     <button
+                      className={`entry-flag${entry.resident ? ' entry-flag--on' : ''}`}
                       onClick={() => void patchEntry(book.id, entry.id, { resident: !entry.resident })}
                       title="切换常驻"
-                      style={{
-                        flex: 'none',
-                        fontSize: 11,
-                        color: entry.resident ? 'var(--err)' : 'var(--text-dim-4)',
-                        padding: '4px 11px',
-                        borderRadius: 12,
-                        background: entry.resident ? 'rgba(226,112,78,.1)' : 'transparent',
-                        border: `1px solid ${
-                          entry.resident ? 'rgba(226,112,78,.25)' : 'var(--line-2)'
-                        }`,
-                        whiteSpace: 'nowrap',
-                        cursor: 'pointer',
-                        fontFamily: 'inherit',
-                      }}
                     >
                       ◈ 常驻
                     </button>
+                    {entry.indexStale && <span className="entry-stale">待重建索引</span>}
                     <div style={{ flex: 1 }} />
                     <Toggle
                       checked={entry.enabled}
@@ -582,42 +553,19 @@ export default function WorldBooksPage() {
                     />
                   )}
 
-                  {entry.indexStale && (
-                    <div style={{ marginTop: 10, fontSize: 11, color: 'var(--warn)' }}>
-                      ✎ 已修改 · 待重新生成 Embedding
-                    </div>
-                  )}
-
                   <textarea
-                    className="textarea textarea--deep textarea--soft"
+                    className="entry-text"
                     rows={2}
                     value={entry.content}
                     onChange={(e) => draftEntry(book.id, entry.id, { content: e.target.value })}
                     onBlur={(e) => void patchEntry(book.id, entry.id, { content: e.target.value })}
                     placeholder="条目内容…"
-                    style={{
-                      marginTop: 9,
-                      border: '1px solid rgba(255,214,170,.08)',
-                      borderRadius: 10,
-                      padding: '11px 14px',
-                      color: 'var(--text-quiet)',
-                      fontSize: 13,
-                    }}
                   />
 
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginTop: 11 }}>
-                    <span
-                      style={{
-                        flex: 'none',
-                        fontSize: 11,
-                        color: 'var(--text-dim-3)',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      关键词
-                    </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+                    <span className="entry-label">关键词</span>
                     <input
-                      className="input-underline-soft"
+                      className="entry-keywords"
                       value={entry.keywords.join(', ')}
                       onChange={(e) =>
                         draftEntry(book.id, entry.id, { keywords: e.target.value.split(/[,，]/) })
@@ -631,7 +579,6 @@ export default function WorldBooksPage() {
                         })
                       }
                       placeholder="逗号分隔，如：禁区, 失联"
-                      style={{ flex: 1, fontSize: 11.5, padding: '4px 2px' }}
                     />
                   </div>
                 </div>

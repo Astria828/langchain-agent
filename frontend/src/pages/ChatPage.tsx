@@ -21,8 +21,12 @@ import type { Message } from '@/types';
 
 /** 对话工作台与流式回复（设计稿第 6561–6683 行） */
 
+/** 面板开关的三段循环：全部显示 → 收起对话列表 → 再收起导航栏 → 回到全部显示 */
+const PANEL_STAGE_COUNT = 3;
+const PANEL_STAGE_HINT = ['隐藏对话列表', '隐藏左侧导航栏', '恢复全部面板'];
+
 export default function ChatPage() {
-  const [listOpen, setListOpen] = useState(true);
+  const [panelStage, setPanelStage] = useState(0);
   const [draft, setDraft] = useState('');
   const [titleDraft, setTitleDraft] = useState('');
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
@@ -54,6 +58,17 @@ export default function ChatPage() {
   const runMessageAction = useAppStore((s) => s.runMessageAction);
   const recommendReply = useAppStore((s) => s.recommendReply);
   const send = useAppStore((s) => s.send);
+  const setNavCollapsed = useAppStore((s) => s.setNavCollapsed);
+
+  const listOpen = panelStage === 0;
+  const cyclePanels = () => {
+    const next = (panelStage + 1) % PANEL_STAGE_COUNT;
+    setPanelStage(next);
+    setNavCollapsed(next === 2);
+  };
+
+  // 离开对话页时把全局导航栏放回来，避免在别的页面没有入口
+  useEffect(() => () => setNavCollapsed(false), [setNavCollapsed]);
 
   const hasSession = !!session;
   const characterName = character?.name ?? '';
@@ -130,8 +145,8 @@ export default function ChatPage() {
         >
           <button
             className="icon-plain"
-            onClick={() => setListOpen((v) => !v)}
-            title="显示/隐藏对话列表"
+            onClick={cyclePanels}
+            title={PANEL_STAGE_HINT[panelStage]}
             style={{ flex: 'none', width: 28, height: 28 }}
           >
             <PanelIcon size={20} />

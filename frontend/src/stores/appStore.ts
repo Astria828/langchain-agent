@@ -49,6 +49,9 @@ interface AppState {
   /* ── 界面偏好 ───────────────────────────────────────── */
   chatStyle: ChatStyle;
   showRagHints: boolean;
+  /** 收起最左侧的全局导航栏（由对话页的面板开关循环控制） */
+  navCollapsed: boolean;
+  setNavCollapsed: (collapsed: boolean) => void;
 
   /* ── 身份 ───────────────────────────────────────────── */
   identity: UserIdentity | null;
@@ -145,6 +148,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   toast: null,
   chatStyle: '沉浸叙事',
   showRagHints: true,
+  navCollapsed: false,
   identity: null,
   contentLoading: false,
   contentError: null,
@@ -183,6 +187,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     clearTimeout(toastTimer);
     set({ toast: null });
   },
+
+  setNavCollapsed: (collapsed) => set({ navCollapsed: collapsed }),
 
   bootstrap: async () => {
     if (get().bootstrapped) return;

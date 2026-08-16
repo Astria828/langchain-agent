@@ -19,6 +19,7 @@ import LogsPage from '@/pages/LogsPage';
 export default function App() {
   const bootstrap = useAppStore((s) => s.bootstrap);
   const bootstrapped = useAppStore((s) => s.bootstrapped);
+  const navCollapsed = useAppStore((s) => s.navCollapsed);
   const sidebar = useResizablePanel({
     storageKey: 'loreweave.layout.sidebarWidth',
     defaultWidth: 224,
@@ -41,16 +42,20 @@ export default function App() {
         color: 'var(--text)',
       }}
     >
-      <Sidebar width={sidebar.width} />
-      <ResizableDivider
-        width={sidebar.width}
-        defaultWidth={224}
-        minWidth={188}
-        maxWidth={320}
-        minRemainingWidth={480}
-        label="调整全局导航栏宽度"
-        onResize={sidebar.setWidth}
-      />
+      {!navCollapsed && (
+        <>
+          <Sidebar width={sidebar.width} />
+          <ResizableDivider
+            width={sidebar.width}
+            defaultWidth={224}
+            minWidth={188}
+            maxWidth={320}
+            minRemainingWidth={480}
+            label="调整全局导航栏宽度"
+            onResize={sidebar.setWidth}
+          />
+        </>
+      )}
 
       <main style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', position: 'relative' }}>
         {bootstrapped ? (

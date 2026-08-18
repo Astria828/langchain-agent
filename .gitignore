@@ -32,3 +32,6 @@ Thumbs.db
 
 # 本地设计文档，不推送
 doc/
+
+# 最初的单文件设计稿，仅本地保留
+织境 LoreWeave.html

@@ -20,6 +20,14 @@ RECOMMENDED_REPLY_PROMPT_PATH = (
 )
 BLOCKS_ARRAY_PATTERN = re.compile(r'"blocks"\s*:\s*\[')
 
+# 推荐回复的历史以角色的回复收尾，若直接请求生成，模型会把它当成
+# “继续补完角色刚才那段话”，返回 " C" 这类续写片段而不是结构化数据。
+# 末尾补一轮用户消息把发言权交回来，模型才会按 system 里的 schema 作答。
+RECOMMENDED_REPLY_DIRECTIVE = (
+    "（系统指令，不是对话内容）请按上面给定的 JSON 结构，"
+    "只输出我接下来可以直接发送的一句话。"
+)
+
 
 async def stream_basic_chat_blocks(
     *,
@@ -169,6 +177,7 @@ def build_recommended_reply_chain(
             messages=[
                 {"role": "system", "content": application_prompt},
                 *messages,
+                {"role": "user", "content": RECOMMENDED_REPLY_DIRECTIVE},
             ],
         )
         return parser.parse(raw_response)

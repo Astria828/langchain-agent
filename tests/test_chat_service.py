@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.chains.chat_chain import RECOMMENDED_REPLY_DIRECTIVE
 from app.core.config import Settings
 from app.core.exceptions import AppError
 from app.core.security import protect_api_key
@@ -1414,8 +1415,11 @@ def test_recommended_reply_uses_history_without_writing_message(tmp_path: Path) 
 
         assert result.content == "我们去看看吧。"
         assert session.scalar(select(func.count(Message.id))) == before_count
-        assert "用户推荐回复规则" in gateway.chat_requests[-1][0]["content"]
-        assert gateway.chat_requests[-1][-1]["content"] == "[台词] 你终于来了。"
+        sent = gateway.chat_requests[-1]
+        assert "用户推荐回复规则" in sent[0]["content"]
+        assert sent[-2]["content"] == "[台词] 你终于来了。"
+        # 历史以角色回复收尾时模型会续写而非作答，末尾必须补回一轮用户消息
+        assert sent[-1] == {"role": "user", "content": RECOMMENDED_REPLY_DIRECTIVE}
     finally:
         session.close()
         engine.dispose()

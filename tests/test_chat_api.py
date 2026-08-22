@@ -320,6 +320,7 @@ def test_message_api_streams_and_persists_ordered_role_reply(tmp_path: Path) -> 
         events = [
             json.loads(frame.removeprefix("data: "))
             for frame in response.text.strip().split("\n\n")
+            if frame.startswith("data: ")
         ]
         assert [event["type"] for event in events] == [
             "block_start",

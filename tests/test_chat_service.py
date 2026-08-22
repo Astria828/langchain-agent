@@ -398,22 +398,10 @@ def collect_basic_reply_events(
     """准备一轮用户消息并收集全部基础 SSE 业务事件。"""
 
     async def collect() -> list[dict[str, object]]:
-        messages, config, api_key, retrieved_entries, user_message_id = (
-            await service.prepare_chat_turn(
-                session_id,
-                SendMessagePayload(content=content),
-            )
-        )
+        start = service.begin_chat_turn(session_id, SendMessagePayload(content=content))
         return [
             event
-            async for event in service.stream_basic_reply(
-                session_id,
-                messages,
-                config,
-                api_key,
-                retrieved_entries,
-                user_message_id,
-            )
+            async for event in service.stream_basic_reply(session_id, start)
         ]
 
     return asyncio.run(collect())
@@ -692,18 +680,27 @@ def test_ten_rounds_consolidate_and_recall_only_in_same_character_session(
             )
         )
 
-        same_character_messages, *_ = asyncio.run(
-            service.prepare_chat_turn(
-                same_character_session.id,
+        def build_prompt(target_session_id: str) -> list[dict[str, str]]:
+            """走完整的两阶段流程，取出实际送给主模型的上下文。"""
+
+            start = service.begin_chat_turn(
+                target_session_id,
                 SendMessagePayload(content="我们继续寻找档案馆。"),
             )
-        )
-        other_character_messages, *_ = asyncio.run(
-            service.prepare_chat_turn(
-                other_character_session.id,
-                SendMessagePayload(content="我们继续寻找档案馆。"),
-            )
-        )
+
+            async def build() -> list[dict[str, str]]:
+                messages, _entries = await service._build_turn_messages(
+                    session_id=target_session_id,
+                    current_user_message_id=start.user_message_id,
+                    retrieval_input=start.current_input,
+                    prompt_input=start.current_input,
+                )
+                return messages
+
+            return asyncio.run(build())
+
+        same_character_messages = build_prompt(same_character_session.id)
+        other_character_messages = build_prompt(other_character_session.id)
 
         assert any(
             memory_content in message["content"] for message in same_character_messages
@@ -1270,12 +1267,7 @@ def test_unconfigured_main_model_rejects_before_saving_user_message(
         )
 
         with pytest.raises(AppError) as error:
-            asyncio.run(
-                service.prepare_chat_turn(
-                    created.id,
-                    SendMessagePayload(content="不会被保存"),
-                )
-            )
+            service.begin_chat_turn(created.id, SendMessagePayload(content="不会被保存"))
 
         assert error.value.code == "MODEL_NOT_CONFIGURED"
         assert [message.role for message in service.list_messages(created.id)] == [
@@ -1303,20 +1295,11 @@ def test_last_reply_can_regenerate_continue_and_delete_in_place(tmp_path: Path) 
         assistant_id = service.list_messages(created.id)[-1].id
 
         async def run_action(action: str) -> list[dict[str, object]]:
-            messages, config, api_key, retrieved, signature = (
-                await service.prepare_message_action(created.id, assistant_id, action)
-            )
+            start = service.begin_message_action(created.id, assistant_id, action)
             return [
                 event
                 async for event in service.stream_message_action(
-                    created.id,
-                    assistant_id,
-                    action,
-                    messages,
-                    config,
-                    api_key,
-                    retrieved,
-                    signature,
+                    created.id, action, start
                 )
             ]
 
@@ -1485,6 +1468,75 @@ def test_thinking_events_are_coalesced_by_flush_threshold(tmp_path: Path) -> Non
         thinking = [event for event in events if event["type"] == "thinking"]
         assert len(thinking) == 3
         assert "".join(str(event["text"]) for event in thinking) == "推理增量测试片段十字" * 12
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_begin_chat_turn_persists_input_without_any_network_call(tmp_path: Path) -> None:
+    """建立 SSE 之前只落库用户原文，不做 Embedding 往返。"""
+
+    gateway = StubGateway()
+    service, session, engine, chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        configure_embedding(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+
+        start = service.begin_chat_turn(created.id, SendMessagePayload(content="在吗？"))
+
+        # 用户原文必须先落库，断线也不会丢
+        assert [message.role for message in service.list_messages(created.id)] == [
+            "assistant",
+            "user",
+        ]
+        assert start.current_input == "在吗？"
+        # 检索与向量查询都还没发生
+        assert gateway.embedding_requests == []
+        assert chroma.worldbook_queries == []
+        assert chroma.memory_queries == []
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_regenerate_reuses_the_retrieval_embedding(tmp_path: Path) -> None:
+    """重说的检索文本与上一次逐字相同，不应再算一次向量。"""
+
+    gateway = StubGateway()
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        configure_embedding(session)
+        character = add_character(session)
+        book, _entries = add_world_book_with_entries(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=book.id)
+            )
+        )
+        collect_basic_reply_events(service, created.id, "带我去银港拍照。")
+        assistant_id = service.list_messages(created.id)[-1].id
+        after_first_turn = len(gateway.embedding_requests)
+        assert after_first_turn == 1
+
+        async def regenerate() -> None:
+            start = service.begin_message_action(created.id, assistant_id, "regenerate")
+            async for _event in service.stream_message_action(
+                created.id, "regenerate", start
+            ):
+                pass
+
+        asyncio.run(regenerate())
+        asyncio.run(regenerate())
+
+        # 两次重说都命中缓存，Embedding 调用次数保持不变
+        assert len(gateway.embedding_requests) == after_first_turn
     finally:
         session.close()
         engine.dispose()

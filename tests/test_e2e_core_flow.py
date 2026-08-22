@@ -198,6 +198,7 @@ def test_core_user_flow_from_model_setup_to_memory_and_exports(tmp_path: Path) -
                 events = [
                     json.loads(frame.removeprefix("data: "))
                     for frame in response.text.strip().split("\n\n")
+                    if frame.startswith("data: ")
                 ]
                 assert events[-1] == {
                     "type": "done",

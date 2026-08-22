@@ -30,6 +30,10 @@ from app.tasks.vector_cleanup_task import run_pending_vector_cleanup_tasks
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
+# SSE 注释帧：先推一帧把响应头冲出去，让前端 fetch() 立刻拿到可读的 body，
+# 后续的检索与生成才不会把整段等待压在连接建立之前。解析端按规范忽略它。
+SSE_READY_FRAME = ": ready\n\n"
+
 
 def get_chat_service(
     session: Annotated[DatabaseSession, Depends(get_db_session)],
@@ -230,24 +234,15 @@ async def send_message(
     background_tasks: BackgroundTasks,
     service: Annotated[ChatService, Depends(get_chat_service)],
 ) -> StreamingResponse:
-    """保存用户输入，执行双 RAG，并以 SSE 返回角色回复。"""
+    """保存用户输入，随即建立 SSE；双 RAG 与生成都在流内进行。"""
 
-    messages, config, api_key, retrieved_entries, user_message_id = await service.prepare_chat_turn(
-        session_id,
-        payload,
-    )
+    start = service.begin_chat_turn(session_id, payload)
 
     async def event_stream():
         """把服务层业务事件编码为单行 UTF-8 SSE 数据帧。"""
 
-        async for event in service.stream_basic_reply(
-            session_id,
-            messages,
-            config,
-            api_key,
-            retrieved_entries,
-            user_message_id,
-        ):
+        yield SSE_READY_FRAME
+        async for event in service.stream_basic_reply(session_id, start):
             data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
             yield f"data: {data}\n\n"
 
@@ -277,29 +272,15 @@ async def _message_action_response(
     action: str,
     service: ChatService,
 ) -> StreamingResponse:
-    """准备并编码重说或继续说的统一 SSE 响应。"""
+    """校验后立即建立 SSE，双 RAG 与生成都在流内进行。"""
 
-    messages, config, api_key, retrieved_entries, signature = (
-        await service.prepare_message_action(
-            session_id,
-            assistant_message_id,
-            action,
-        )
-    )
+    start = service.begin_message_action(session_id, assistant_message_id, action)
 
     async def event_stream():
         """把消息操作事件编码为 UTF-8 SSE 数据帧。"""
 
-        async for event in service.stream_message_action(
-            session_id,
-            assistant_message_id,
-            action,
-            messages,
-            config,
-            api_key,
-            retrieved_entries,
-            signature,
-        ):
+        yield SSE_READY_FRAME
+        async for event in service.stream_message_action(session_id, action, start):
             data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
             yield f"data: {data}\n\n"
 

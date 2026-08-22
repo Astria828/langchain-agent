@@ -2,7 +2,10 @@
 
 import json
 import logging
+from collections import OrderedDict
 from collections.abc import AsyncIterator
+from threading import RLock
+from typing import NamedTuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DatabaseSession
@@ -49,6 +52,32 @@ RETRIEVAL_HISTORY_ROUNDS = 4
 DELETED_CHARACTER_NAME = "已删除角色卡"
 # 推理增量攒到这个长度才发一帧 SSE，避免前端逐 token 重渲染。
 THINKING_FLUSH_CHARS = 40
+# 重说与继续说的检索文本和上一次逐字相同，缓存住就不必重算同一个向量。
+# 单条 4096 维向量约 130KB，容量取小值即可覆盖“连点几次重说”的场景。
+RETRIEVAL_EMBEDDING_CACHE_SIZE = 8
+
+_retrieval_embedding_lock = RLock()
+_retrieval_embeddings: OrderedDict[tuple[int, str, str], list[float]] = OrderedDict()
+
+
+def _cached_retrieval_embedding(key: tuple[int, str, str]) -> list[float] | None:
+    """取出缓存的检索向量并刷新其最近使用顺序。"""
+
+    with _retrieval_embedding_lock:
+        embedding = _retrieval_embeddings.get(key)
+        if embedding is not None:
+            _retrieval_embeddings.move_to_end(key)
+        return embedding
+
+
+def _store_retrieval_embedding(key: tuple[int, str, str], embedding: list[float]) -> None:
+    """只缓存成功结果，避免一次瞬时失败影响后续轮次。"""
+
+    with _retrieval_embedding_lock:
+        _retrieval_embeddings[key] = embedding
+        _retrieval_embeddings.move_to_end(key)
+        while len(_retrieval_embeddings) > RETRIEVAL_EMBEDDING_CACHE_SIZE:
+            _retrieval_embeddings.popitem(last=False)
 CONTINUE_REPLY_INSTRUCTION = (
     "继续上一条角色回复，从结束处自然续写。"
     "不要重复已有内容，也不要假设用户产生了新的动作或台词。"
@@ -86,6 +115,28 @@ def session_to_dto(
         created_at=chat_session.created_at,
         updated_at=chat_session.updated_at,
     )
+
+
+class ChatTurnStart(NamedTuple):
+    """建立 SSE 之前就能确定的一轮对话上下文。"""
+
+    config: ModelConfig
+    api_key: str
+    user_message_id: str
+    current_input: str
+
+
+class MessageActionStart(NamedTuple):
+    """重说或继续说在建立 SSE 之前确定的上下文。"""
+
+    config: ModelConfig
+    api_key: str
+    assistant_message_id: str
+    user_message_id: str
+    retrieval_input: str
+    prompt_input: str
+    excluded_message_ids: tuple[str, ...]
+    expected_signature: str
 
 
 class ChatService:
@@ -199,13 +250,16 @@ class ChatService:
         self.repository.delete(user_message)
         self.session.commit()
 
-    async def prepare_message_action(
+    def begin_message_action(
         self,
         session_id: str,
         assistant_message_id: str,
         action: str,
-    ) -> tuple[list[dict[str, str]], ModelConfig, str, list[str], str]:
-        """为最后一条助手回复准备重说或继续说上下文。"""
+    ) -> MessageActionStart:
+        """只做重说或继续说必须先以 HTTP 状态码报错的校验。
+
+        与首轮发送一样，双 RAG 留到 SSE 建立之后再执行。
+        """
 
         if action not in {"regenerate", "continue"}:
             raise ValueError("不支持的消息操作")
@@ -213,44 +267,29 @@ class ChatService:
             session_id,
             assistant_message_id,
         )
-        identity, character = self._get_session_context(chat_session)
+        self._get_session_context(chat_session)
         config, api_key = self._require_main_model_config()
-        embedding_config = self._get_embedding_config()
-        if embedding_config.rebuild_required:
+        if self._get_embedding_config().rebuild_required:
             raise AppError(
                 status_code=503,
                 code="INDEX_REBUILD_REQUIRED",
                 message="Embedding 索引需要完成重建后才能继续对话",
             )
 
-        current_input = self._history_message_to_model(user_message)["content"]
-        worldbook_entries, memories = await self._retrieve_reply_context(
-            chat_session=chat_session,
-            current_user_message_id=user_message.id,
-            current_input=current_input,
-            embedding_config=embedding_config,
-        )
-        excluded_message_ids = (
-            (user_message.id, assistant_message.id) if action == "regenerate" else ()
-        )
-        messages = self._build_basic_chat_messages(
-            session_id=session_id,
-            current_user_message_id=user_message.id,
-            current_input=(
-                current_input if action == "regenerate" else CONTINUE_REPLY_INSTRUCTION
+        retrieval_input = self._history_message_to_model(user_message)["content"]
+        return MessageActionStart(
+            config=config,
+            api_key=api_key,
+            assistant_message_id=assistant_message.id,
+            user_message_id=user_message.id,
+            retrieval_input=retrieval_input,
+            prompt_input=(
+                retrieval_input if action == "regenerate" else CONTINUE_REPLY_INSTRUCTION
             ),
-            identity=identity,
-            character=character,
-            worldbook_entries=worldbook_entries,
-            memories=memories,
-            excluded_message_ids=excluded_message_ids,
-        )
-        return (
-            messages,
-            config,
-            api_key,
-            [entry.name for entry in worldbook_entries],
-            self._message_signature(assistant_message),
+            excluded_message_ids=(
+                (user_message.id, assistant_message.id) if action == "regenerate" else ()
+            ),
+            expected_signature=self._message_signature(assistant_message),
         )
 
     async def generate_recommended_reply(self, session_id: str) -> RecommendedReplyOutput:
@@ -309,24 +348,22 @@ class ChatService:
                 message="推荐回复生成失败",
             ) from exc
 
-    async def prepare_chat_turn(
-        self,
-        session_id: str,
-        payload: SendMessagePayload,
-    ) -> tuple[list[dict[str, str]], ModelConfig, str, list[str], str]:
-        """在建立 SSE 前保存用户原文、执行双 RAG 并返回完整上下文。"""
+    def begin_chat_turn(self, session_id: str, payload: SendMessagePayload) -> ChatTurnStart:
+        """只做必须以 HTTP 状态码报错的校验，并落库用户原文。
+
+        双 RAG 与 Prompt 组装留到 SSE 建立之后再做：Embedding 往返约 1.6 秒，
+        端点挂起时更是两次超时约 30 秒，放在响应头之前会让前端整段拿不到连接。
+        """
 
         chat_session = self._get_session_model(session_id)
-        identity, character = self._get_session_context(chat_session)
+        self._get_session_context(chat_session)
         config, api_key = self._require_main_model_config()
-        embedding_config = self._get_embedding_config()
-        if embedding_config.rebuild_required:
+        if self._get_embedding_config().rebuild_required:
             raise AppError(
                 status_code=503,
                 code="INDEX_REBUILD_REQUIRED",
                 message="Embedding 索引需要完成重建后才能继续对话",
             )
-        embedding_version = embedding_config.config_version
 
         next_position = self.session.scalar(
             select(func.max(MessageModel.position)).where(MessageModel.session_id == session_id)
@@ -350,87 +387,74 @@ class ChatService:
         )
         chat_session.updated_at = utc_now()
         self.session.commit()
+        return ChatTurnStart(
+            config=config,
+            api_key=api_key,
+            user_message_id=user_message.id,
+            current_input=payload.content,
+        )
 
-        retrieval_text = self.build_retrieval_text(
-            session_id=session_id,
-            current_user_message_id=user_message.id,
-            current_input=payload.content,
-        )
-        query_embedding = await self._create_retrieval_embedding(
-            session_id=session_id,
-            retrieval_text=retrieval_text,
-            config=embedding_config,
-        )
-        self.session.expire_all()
-        current_embedding_config = self._get_embedding_config()
-        if (
-            current_embedding_config.rebuild_required
-            or current_embedding_config.config_version != embedding_version
-        ):
-            logger.warning(
-                "Embedding 配置在检索期间发生变化，双 RAG 向量召回已降级 session_id=%s",
-                session_id,
-                extra={
-                    "event": "chat_retrieval_degraded_config_changed",
-                    "business_ids": {"sessionId": session_id},
-                },
-            )
-            query_embedding = None
-        worldbook_entries = self._retrieve_worldbook_context(
+    async def _build_turn_messages(
+        self,
+        *,
+        session_id: str,
+        current_user_message_id: str,
+        retrieval_input: str,
+        prompt_input: str,
+        excluded_message_ids: tuple[str, ...] | None = None,
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        """执行双 RAG 并组装 Prompt，返回上下文与命中的世界书条目名。"""
+
+        chat_session = self._get_session_model(session_id)
+        identity, character = self._get_session_context(chat_session)
+        worldbook_entries, memories = await self._retrieve_reply_context(
             chat_session=chat_session,
-            current_input=payload.content,
-            query_embedding=query_embedding,
-            embedding_version=embedding_version,
-        )
-        memories = self._retrieve_memory_context(
-            chat_session=chat_session,
-            query_embedding=query_embedding,
-            embedding_version=embedding_version,
+            current_user_message_id=current_user_message_id,
+            current_input=retrieval_input,
+            embedding_config=self._get_embedding_config(),
         )
         messages = self._build_basic_chat_messages(
             session_id=session_id,
-            current_user_message_id=user_message.id,
-            current_input=payload.content,
+            current_user_message_id=current_user_message_id,
+            current_input=prompt_input,
             identity=identity,
             character=character,
             worldbook_entries=worldbook_entries,
             memories=memories,
+            excluded_message_ids=excluded_message_ids,
         )
-        return (
-            messages,
-            config,
-            api_key,
-            [entry.name for entry in worldbook_entries],
-            user_message.id,
-        )
+        return messages, [entry.name for entry in worldbook_entries]
 
     async def stream_basic_reply(
         self,
         session_id: str,
-        messages: list[dict[str, str]],
-        config: ModelConfig,
-        api_key: str,
-        retrieved_entries: list[str],
-        user_message_id: str,
+        start: ChatTurnStart,
     ) -> AsyncIterator[dict[str, object]]:
-        """发送检索提示，逐块展示角色回复，完整校验后原子保存。"""
-
-        if retrieved_entries:
-            yield {"type": "retrieval", "entries": retrieved_entries}
+        """在流内完成双 RAG，逐块展示角色回复，完整校验后原子保存。"""
 
         blocks: list[ChatReplyBlock] = []
+        retrieved_entries: list[str] = []
         try:
+            messages, retrieved_entries = await self._build_turn_messages(
+                session_id=session_id,
+                current_user_message_id=start.user_message_id,
+                retrieval_input=start.current_input,
+                prompt_input=start.current_input,
+            )
+            if retrieved_entries:
+                yield {"type": "retrieval", "entries": retrieved_entries}
+
             async for event in self._stream_reply_events(
                 messages=messages,
-                config=config,
-                api_key=api_key,
+                config=start.config,
+                api_key=start.api_key,
                 blocks=blocks,
             ):
                 yield event
             output = ChatReplyOutput(blocks=blocks)
             assistant_message, round_count = self._save_assistant_reply(
                 session_id,
-                user_message_id,
+                start.user_message_id,
                 output,
                 retrieved_entries,
             )
@@ -471,24 +495,28 @@ class ChatService:
     async def stream_message_action(
         self,
         session_id: str,
-        assistant_message_id: str,
         action: str,
-        messages: list[dict[str, str]],
-        config: ModelConfig,
-        api_key: str,
-        retrieved_entries: list[str],
-        expected_signature: str,
+        start: MessageActionStart,
     ) -> AsyncIterator[dict[str, object]]:
-        """生成重说或继续说内容，并覆盖或追加到同一条助手消息。"""
+        """在流内完成双 RAG，并把结果覆盖或追加到同一条助手消息。"""
 
-        if retrieved_entries:
-            yield {"type": "retrieval", "entries": retrieved_entries}
         blocks: list[ChatReplyBlock] = []
+        retrieved_entries: list[str] = []
         try:
+            messages, retrieved_entries = await self._build_turn_messages(
+                session_id=session_id,
+                current_user_message_id=start.user_message_id,
+                retrieval_input=start.retrieval_input,
+                prompt_input=start.prompt_input,
+                excluded_message_ids=start.excluded_message_ids,
+            )
+            if retrieved_entries:
+                yield {"type": "retrieval", "entries": retrieved_entries}
+
             async for event in self._stream_reply_events(
                 messages=messages,
-                config=config,
-                api_key=api_key,
+                config=start.config,
+                api_key=start.api_key,
                 blocks=blocks,
             ):
                 yield event
@@ -496,16 +524,16 @@ class ChatService:
             if action == "regenerate":
                 assistant_message, round_count = self._replace_assistant_reply(
                     session_id,
-                    assistant_message_id,
-                    expected_signature,
+                    start.assistant_message_id,
+                    start.expected_signature,
                     output,
                     retrieved_entries,
                 )
             elif action == "continue":
                 assistant_message, round_count = self._append_assistant_reply(
                     session_id,
-                    assistant_message_id,
-                    expected_signature,
+                    start.assistant_message_id,
+                    start.expected_signature,
                     output,
                     retrieved_entries,
                 )
@@ -523,7 +551,7 @@ class ChatService:
                     "event": "chat_message_action_failed",
                     "business_ids": {
                         "sessionId": session_id,
-                        "messageId": assistant_message_id,
+                        "messageId": start.assistant_message_id,
                     },
                 },
             )
@@ -729,6 +757,25 @@ class ChatService:
                 },
             )
             return None
+
+        # 同一轮的重说 / 继续说检索文本逐字相同，命中即可跳过一次网络往返
+        cache_key = (
+            config.config_version,
+            session_id,
+            calculate_content_hash(retrieval_text),
+        )
+        cached = _cached_retrieval_embedding(cache_key)
+        if cached is not None:
+            logger.debug(
+                "检索向量命中缓存 session_id=%s",
+                session_id,
+                extra={
+                    "event": "chat_retrieval_embedding_cache_hit",
+                    "business_ids": {"sessionId": session_id},
+                },
+            )
+            return cached
+
         try:
             embeddings = await self.gateway.create_embeddings(
                 base_url=config.base_url,
@@ -762,6 +809,7 @@ class ChatService:
                 },
             )
             return None
+        _store_retrieval_embedding(cache_key, embeddings[0])
         return embeddings[0]
 
     async def _retrieve_reply_context(

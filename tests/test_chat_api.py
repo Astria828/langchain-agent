@@ -40,7 +40,7 @@ class UnusedGateway:
         """返回推荐回复等非流式任务的确定结果。"""
 
         messages = _kwargs["messages"]
-        if "用户推荐回复规则" in messages[0]["content"]:
+        if "用户推荐回复规则" in messages[-1]["content"]:
             return '{"content":"我们继续前进吧。"}'
         raise AssertionError("基础角色回复必须使用流式模型调用")
 

@@ -133,17 +133,23 @@ class ModelGateway:
         model: str,
         api_key: str,
         messages: list[dict[str, str]],
+        response_format: dict[str, object] | None = None,
     ) -> str:
         """调用主模型并返回经过结构校验的文本内容。"""
+
+        json_body: dict[str, object] = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0,
+        }
+        if response_format is not None:
+            json_body["response_format"] = response_format
 
         payload = await self._post(
             url=f"{normalize_base_url(base_url)}/chat/completions",
             api_key=api_key,
-            json_body={
-                "model": model,
-                "messages": messages,
-                "temperature": 0,
-            },
+            json_body=json_body,
+            model=model,
         )
         choices = payload.get("choices")
         first_choice = choices[0] if isinstance(choices, list) and choices else None
@@ -337,6 +343,7 @@ class ModelGateway:
             url=f"{normalize_base_url(base_url)}/embeddings",
             api_key=api_key,
             json_body={"model": model, "input": texts},
+            model=model,
         )
         data = payload.get("data")
         if not isinstance(data, list) or len(data) != len(texts):
@@ -372,6 +379,7 @@ class ModelGateway:
         url: str,
         api_key: str,
         json_body: dict[str, object],
+        model: str,
     ) -> dict[str, object]:
         """对真实瞬时故障重试一次，并把上游错误转换为脱敏业务错误。"""
 
@@ -406,6 +414,27 @@ class ModelGateway:
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
                     continue
                 if not response.is_success:
+                    # 与 SSE 通道保持一致：上游只是不认识 response_format 时，
+                    # 去掉这一个字段重试，而不是让整次调用失败。
+                    if (
+                        "response_format" in json_body
+                        and response.status_code in STRUCTURED_OUTPUT_REJECTED_CODES
+                        and attempt + 1 < MAX_ATTEMPTS
+                    ):
+                        json_body.pop("response_format")
+                        logger.warning(
+                            "上游拒绝结构化输出约束，退回纯提示词模式 model=%s status=%s",
+                            model,
+                            response.status_code,
+                            extra={
+                                "event": "model_structured_output_unsupported",
+                                "business_ids": {
+                                    "model": model,
+                                    "statusCode": str(response.status_code),
+                                },
+                            },
+                        )
+                        continue
                     raise AppError(
                         status_code=502,
                         code="MODEL_CONNECTION_FAILED",

@@ -51,9 +51,24 @@ REPLY_RESPONSE_FORMAT: dict[str, object] = {
     },
 }
 
+RECOMMENDED_REPLY_JSON_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["content"],
+    "properties": {"content": {"type": "string"}},
+}
+RECOMMENDED_REPLY_RESPONSE_FORMAT: dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "recommended_reply",
+        "strict": True,
+        "schema": RECOMMENDED_REPLY_JSON_SCHEMA,
+    },
+}
+
 # 推荐回复的历史以角色的回复收尾，若直接请求生成，模型会把它当成
 # “继续补完角色刚才那段话”，返回 " C" 这类续写片段而不是结构化数据。
-# 末尾补一轮用户消息把发言权交回来，模型才会按 system 里的 schema 作答。
+# 末尾补一轮用户消息把发言权交回来，模型才会按给定的 schema 作答。
 RECOMMENDED_REPLY_DIRECTIVE = (
     "（系统指令，不是对话内容）请按上面给定的 JSON 结构，"
     "只输出我接下来可以直接发送的一句话。"
@@ -181,9 +196,12 @@ def build_recommended_reply_chain(
     """根据当前会话上下文和最近历史生成一条尚未发送的用户回复。"""
 
     parser = PydanticOutputParser(pydantic_object=RecommendedReplyOutput)
+    # 规则跟在历史之后而不是放在最前面的 system：角色卡本身就是一整套扮演指令，
+    # 会话越长，开头那份规则离生成点越远，模型越容易接着角色的语气继续往下写。
     application_prompt = (
         f"{RECOMMENDED_REPLY_PROMPT_PATH.read_text(encoding='utf-8').strip()}\n\n"
-        f"{parser.get_format_instructions()}"
+        f"{parser.get_format_instructions()}\n\n"
+        f"{RECOMMENDED_REPLY_DIRECTIVE}"
     )
 
     async def generate(messages: list[dict[str, str]]) -> RecommendedReplyOutput:
@@ -194,10 +212,10 @@ def build_recommended_reply_chain(
             model=model,
             api_key=api_key,
             messages=[
-                {"role": "system", "content": application_prompt},
                 *messages,
-                {"role": "user", "content": RECOMMENDED_REPLY_DIRECTIVE},
+                {"role": "user", "content": application_prompt},
             ],
+            response_format=RECOMMENDED_REPLY_RESPONSE_FORMAT,
         )
         return parser.parse(raw_response)
 

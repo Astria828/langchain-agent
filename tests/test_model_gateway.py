@@ -110,6 +110,73 @@ def test_chat_completion_returns_validated_message_content() -> None:
     assert content == '{"drafts": []}'
 
 
+def test_chat_completion_sends_response_format_when_requested() -> None:
+    """非流式调用同样支持结构化输出约束，不传时请求体里不出现该字段。"""
+
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"content": "走吧"}'}}]},
+        )
+
+    response_format = {"type": "json_schema", "json_schema": {"name": "draft"}}
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+    asyncio.run(
+        gateway.create_chat_completion(
+            base_url="https://models.example/v1",
+            model="chat-model",
+            api_key="sk-test-main",
+            messages=[{"role": "user", "content": "原文"}],
+            response_format=response_format,
+        )
+    )
+    asyncio.run(
+        gateway.create_chat_completion(
+            base_url="https://models.example/v1",
+            model="chat-model",
+            api_key="sk-test-main",
+            messages=[{"role": "user", "content": "原文"}],
+        )
+    )
+
+    assert captured[0]["response_format"] == response_format
+    assert "response_format" not in captured[1]
+
+
+def test_chat_completion_falls_back_when_response_format_rejected() -> None:
+    """上游拒绝 response_format 时去掉该字段重试，而不是整次调用失败。"""
+
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        captured.append(payload)
+        if "response_format" in payload:
+            return httpx.Response(400, json={"error": {"message": "unsupported"}})
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"content": "走吧"}'}}]},
+        )
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+    content = asyncio.run(
+        gateway.create_chat_completion(
+            base_url="https://models.example/v1",
+            model="chat-model",
+            api_key="sk-test-main",
+            messages=[{"role": "user", "content": "原文"}],
+            response_format={"type": "json_schema", "json_schema": {"name": "draft"}},
+        )
+    )
+
+    assert len(captured) == 2
+    assert "response_format" not in captured[1]
+    assert content == '{"content": "走吧"}'
+
+
 def test_chat_completion_rejects_missing_message_content() -> None:
     """主模型没有返回可用文本时转换为稳定结构化输出错误。"""
 

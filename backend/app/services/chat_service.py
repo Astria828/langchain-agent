@@ -330,7 +330,8 @@ class ChatService:
         """基于当前身份、角色卡和最近二十轮生成一条不落库的用户回复建议。"""
 
         chat_session = self._get_session_model(session_id)
-        identity, character = self._get_session_context(chat_session)
+        # 角色卡不进上下文，但这里仍要走一次校验：角色缺失时应按 404 报错而不是照常生成。
+        identity, _character = self._get_session_context(chat_session)
         latest_message = self.session.scalar(
             select(MessageModel)
             .where(MessageModel.session_id == session_id)
@@ -356,7 +357,9 @@ class ChatService:
             ).all()
         )
         history.reverse()
-        messages = self._build_fixed_context_messages(identity, character)
+        # 角色卡是一整套“你要怎么扮演”的指令，在推荐用户回复时会把模型拉回角色语气，
+        # 卡片越长压得越死。角色的名字、语气和当前处境历史里已经有了，这里只给用户身份。
+        messages = [self._build_identity_message(identity)]
         messages.extend(self._history_message_to_model(message) for message in history)
         chain = build_recommended_reply_chain(
             gateway=self.gateway,
@@ -1079,26 +1082,33 @@ class ChatService:
         return messages
 
     @staticmethod
+    def _build_identity_message(identity: UserIdentity) -> dict[str, str]:
+        """构造用户身份 system 消息。"""
+
+        return {
+            "role": "system",
+            "content": (
+                "用户身份：\n"
+                f"姓名：{identity.name}\n"
+                f"身份名称：{identity.persona_name}\n"
+                f"用户设定：{identity.bio}"
+            ),
+        }
+
+    @classmethod
     def _build_fixed_context_messages(
+        cls,
         identity: UserIdentity,
         character: Character,
     ) -> list[dict[str, str]]:
-        """构造角色回复和用户推荐共同使用的当前身份、角色卡上下文。"""
+        """构造角色回复使用的当前身份、角色卡上下文。"""
 
         examples = json.loads(character.dialogue_examples_json)
         examples_text = "\n".join(
             f"用户示例：{example['user']}\n角色示例：{example['assistant']}" for example in examples
         )
         return [
-            {
-                "role": "system",
-                "content": (
-                    "用户身份：\n"
-                    f"姓名：{identity.name}\n"
-                    f"身份名称：{identity.persona_name}\n"
-                    f"用户设定：{identity.bio}"
-                ),
-            },
+            cls._build_identity_message(identity),
             {
                 "role": "system",
                 "content": (

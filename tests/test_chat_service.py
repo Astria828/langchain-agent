@@ -1416,10 +1416,17 @@ def test_recommended_reply_uses_history_without_writing_message(tmp_path: Path) 
         assert result.content == "我们去看看吧。"
         assert session.scalar(select(func.count(Message.id))) == before_count
         sent = gateway.chat_requests[-1]
-        assert "用户推荐回复规则" in sent[0]["content"]
+        # 角色卡是扮演指令，会把推荐拉回角色语气，这条链路只保留用户身份
+        assert sent[0]["content"].startswith("用户身份：")
+        assert all("角色卡：" not in message["content"] for message in sent)
+        assert all(character.system_prompt not in message["content"] for message in sent)
         assert sent[-2]["content"] == "[台词] 你终于来了。"
+        # 规则必须紧贴生成点：角色卡越长、历史越多，放在开头的规则越压不住扮演惯性
+        assert sent[-1]["role"] == "user"
+        assert "用户推荐回复规则" in sent[-1]["content"]
         # 历史以角色回复收尾时模型会续写而非作答，末尾必须补回一轮用户消息
-        assert sent[-1] == {"role": "user", "content": RECOMMENDED_REPLY_DIRECTIVE}
+        assert sent[-1]["content"].endswith(RECOMMENDED_REPLY_DIRECTIVE)
+        assert all("用户推荐回复规则" not in message["content"] for message in sent[:-1])
     finally:
         session.close()
         engine.dispose()

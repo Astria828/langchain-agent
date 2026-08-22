@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     environment: Literal["development", "test", "production"] = "development"
     frontend_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     data_dir: Path = Path("data")
+    # 角色回复的输出上限。不下发时由上游取模型默认值，长回复会在 JSON 中途被截断。
+    chat_max_tokens: int = 8192
 
     @property
     def cors_origins(self) -> list[str]:

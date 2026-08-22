@@ -5,11 +5,11 @@ import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.runnables import Runnable, RunnableLambda
 from pydantic import ValidationError
 
+from app.core.config import get_settings
 from app.core.exceptions import AppError
 from app.gateways.model_gateway import ModelGateway
 from app.schemas.dto import ChatReplyBlock, ChatReplyOutput, RecommendedReplyOutput
@@ -19,6 +19,37 @@ RECOMMENDED_REPLY_PROMPT_PATH = (
     Path(__file__).resolve().parents[1] / "prompts" / "recommended_reply.md"
 )
 BLOCKS_ARRAY_PATTERN = re.compile(r'"blocks"\s*:\s*\[')
+
+# 发给上游的 JSON Schema 手写而不是从 ChatReplyOutput 生成：
+# strict 模式要求每层都写死 additionalProperties=false 且不接受 minItems 这类关键字，
+# 而 Pydantic 侧的校验规则可以独立演进。两者的字段契约必须保持一致。
+REPLY_JSON_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["blocks"],
+    "properties": {
+        "blocks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["type", "content"],
+                "properties": {
+                    "type": {"type": "string", "enum": ["action", "dialogue"]},
+                    "content": {"type": "string"},
+                },
+            },
+        }
+    },
+}
+REPLY_RESPONSE_FORMAT: dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "chat_reply",
+        "strict": True,
+        "schema": REPLY_JSON_SCHEMA,
+    },
+}
 
 # 推荐回复的历史以角色的回复收尾，若直接请求生成，模型会把它当成
 # “继续补完角色刚才那段话”，返回 " C" 这类续写片段而不是结构化数据。
@@ -43,7 +74,6 @@ async def stream_basic_chat_blocks(
     application_prompt = (
         f"{PROMPT_PATH.read_text(encoding='utf-8').strip()}\n\n{parser.get_format_instructions()}"
     )
-    raw_parts: list[str] = []
     prefix = ""
     object_chars: list[str] = []
     emitted_blocks: list[ChatReplyBlock] = []
@@ -61,12 +91,14 @@ async def stream_basic_chat_blocks(
             {"role": "system", "content": application_prompt},
             *messages,
         ],
+        # 不显式给上限时按上游默认值截断，长回复会在 JSON 中途被切断。
+        max_tokens=get_settings().chat_max_tokens,
+        response_format=REPLY_RESPONSE_FORMAT,
     ):
         # 推理增量不是回复正文，直接丢弃，避免污染 JSON 结构解析。
         if chunk.kind == "reasoning":
             continue
 
-        raw_parts.append(chunk.text)
         pending = chunk.text
         if not array_started:
             prefix += pending
@@ -128,26 +160,14 @@ async def stream_basic_chat_blocks(
                     yield block
                     object_chars = []
 
-    raw_response = "".join(raw_parts)
+    # 逐块解析时已经用 ChatReplyBlock 校验过每个内容块，这里只确认数组本身收尾完整。
+    # 不再对整段原文做二次解析：那会让 JSON 前后的寒暄或尾随逗号
+    # 把已经正确交付的内容块整条判废。
     if not array_started or not array_closed or object_depth != 0 or not emitted_blocks:
         raise AppError(
             status_code=502,
             code="MODEL_OUTPUT_INVALID",
             message="主模型返回的内容块结构不完整",
-        )
-    try:
-        output = parser.parse(raw_response)
-    except OutputParserException as exc:
-        raise AppError(
-            status_code=502,
-            code="MODEL_OUTPUT_INVALID",
-            message="主模型返回的内容块结构无效",
-        ) from exc
-    if output.blocks != emitted_blocks:
-        raise AppError(
-            status_code=502,
-            code="MODEL_OUTPUT_INVALID",
-            message="主模型返回的内容块前后不一致",
         )
 
 

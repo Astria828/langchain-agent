@@ -1,6 +1,7 @@
 """OpenAI-compatible 主模型与 Embedding 连接测试网关。"""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from json import JSONDecodeError, loads
 from typing import Literal, NamedTuple
@@ -9,10 +10,54 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from app.core.exceptions import AppError
+from app.core.logging import sanitize_log_text
+
+logger = logging.getLogger(__name__)
 
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
+# 不认识 response_format 的上游会直接拒绝整个请求，此时退回无结构化约束再试一次，
+# 避免为了兼容弱模型反而让原本正常的服务不可用。
+STRUCTURED_OUTPUT_REJECTED_CODES = {400, 404, 415, 422}
 MAX_ATTEMPTS = 2
 RETRY_DELAY_SECONDS = 0.25
+UPSTREAM_ERROR_MESSAGE_LIMIT = 200
+# 鉴权失败的响应正文最可能把提交的凭据原样回显，这类错误一律不转述上游描述。
+CREDENTIAL_SENSITIVE_STATUS_CODES = {401, 403}
+
+
+def _error_suffix(response: httpx.Response) -> str:
+    """尽力从失败响应体中补出上游错误描述，读不出来或涉及凭据就返回空串。"""
+
+    if response.status_code in CREDENTIAL_SENSITIVE_STATUS_CODES:
+        return ""
+    try:
+        payload = response.json()
+    except (JSONDecodeError, UnicodeDecodeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    message = upstream_error_message(payload)
+    return f"：{message}" if message else ""
+
+
+def upstream_error_message(payload: dict[str, object]) -> str | None:
+    """从 OpenAI 兼容响应体中取出上游错误描述，没有错误则返回 None。"""
+
+    error = payload.get("error")
+    if error is None:
+        return None
+    if isinstance(error, dict):
+        if error.get("code") in CREDENTIAL_SENSITIVE_STATUS_CODES:
+            return "上游鉴权失败"
+        detail = error.get("message") or error.get("code") or error.get("type")
+    else:
+        detail = error
+    text = " ".join(sanitize_log_text(detail if detail is not None else error).split())
+    if not text:
+        return "上游未提供错误描述"
+    if len(text) > UPSTREAM_ERROR_MESSAGE_LIMIT:
+        return f"{text[:UPSTREAM_ERROR_MESSAGE_LIMIT]}…"
+    return text
 
 
 class ModelStreamChunk(NamedTuple):
@@ -117,6 +162,7 @@ class ModelGateway:
         messages: list[dict[str, str]],
         max_tokens: int | None = None,
         temperature: float | None = None,
+        response_format: dict[str, object] | None = None,
     ) -> AsyncIterator[ModelStreamChunk]:
         """调用主模型 SSE，并按上游顺序返回推理与正文增量。"""
 
@@ -131,6 +177,8 @@ class ModelGateway:
             json_body["max_tokens"] = max_tokens
         if temperature is not None:
             json_body["temperature"] = temperature
+        if response_format is not None:
+            json_body["response_format"] = response_format
 
         url = f"{normalize_base_url(base_url)}/chat/completions"
         async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
@@ -150,6 +198,27 @@ class ModelGateway:
                             await asyncio.sleep(RETRY_DELAY_SECONDS)
                             continue
                         if not response.is_success:
+                            # 上游拒绝的可能只是 response_format 这一个字段，
+                            # 去掉结构化约束重试一次，弱模型的兼容手段不能拖垮强模型。
+                            if (
+                                "response_format" in json_body
+                                and response.status_code in STRUCTURED_OUTPUT_REJECTED_CODES
+                                and attempt + 1 < MAX_ATTEMPTS
+                            ):
+                                json_body.pop("response_format")
+                                logger.warning(
+                                    "上游拒绝结构化输出约束，退回纯提示词模式 model=%s status=%s",
+                                    model,
+                                    response.status_code,
+                                    extra={
+                                        "event": "model_structured_output_unsupported",
+                                        "business_ids": {
+                                            "model": model,
+                                            "statusCode": str(response.status_code),
+                                        },
+                                    },
+                                )
+                                continue
                             raise AppError(
                                 status_code=502,
                                 code="MODEL_CONNECTION_FAILED",
@@ -177,6 +246,17 @@ class ModelGateway:
                                     status_code=502,
                                     code="MODEL_OUTPUT_INVALID",
                                     message="模型服务返回格式无效",
+                                )
+
+                            # 上游可以在 HTTP 200 的流中间推送错误帧（限流、供应商掉线、
+                            # 内容过滤）。这类帧没有 choices，必须按调用失败上报，
+                            # 否则会被误判成模型不会按格式输出。
+                            error_message = upstream_error_message(payload)
+                            if error_message is not None:
+                                raise AppError(
+                                    status_code=502,
+                                    code="MODEL_CONNECTION_FAILED",
+                                    message=f"模型服务返回错误：{error_message}",
                                 )
 
                             choices = payload.get("choices")
@@ -325,7 +405,10 @@ class ModelGateway:
                     raise AppError(
                         status_code=502,
                         code="MODEL_CONNECTION_FAILED",
-                        message=f"模型服务调用失败（HTTP {response.status_code}）",
+                        message=(
+                            f"模型服务调用失败（HTTP {response.status_code}）"
+                            f"{_error_suffix(response)}"
+                        ),
                     )
 
                 try:
@@ -341,6 +424,14 @@ class ModelGateway:
                         status_code=502,
                         code="MODEL_OUTPUT_INVALID",
                         message="模型服务返回格式无效",
+                    )
+                # 部分网关在 HTTP 200 的响应体里回报上游错误，不能当成正常结果继续解析。
+                error_message = upstream_error_message(payload)
+                if error_message is not None:
+                    raise AppError(
+                        status_code=502,
+                        code="MODEL_CONNECTION_FAILED",
+                        message=f"模型服务返回错误：{error_message}",
                     )
                 return payload
 

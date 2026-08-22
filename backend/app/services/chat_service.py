@@ -458,6 +458,19 @@ class ChatService:
             )
         except AppError as exc:
             self.session.rollback()
+            logger.warning(
+                "基础角色回复生成失败 session_id=%s code=%s",
+                session_id,
+                exc.code,
+                extra={
+                    "event": "chat_reply_failed",
+                    "business_ids": {
+                        "sessionId": session_id,
+                        "errorCode": exc.code,
+                        "model": start.config.model_name,
+                    },
+                },
+            )
             yield {"type": "error", "message": exc.message}
             return
         except Exception:
@@ -539,6 +552,22 @@ class ChatService:
                 raise ValueError("不支持的消息操作")
         except AppError as exc:
             self.session.rollback()
+            logger.warning(
+                "助手消息操作失败 session_id=%s action=%s code=%s",
+                session_id,
+                action,
+                exc.code,
+                extra={
+                    "event": "chat_message_action_failed",
+                    "business_ids": {
+                        "sessionId": session_id,
+                        "messageId": start.assistant_message_id,
+                        "action": action,
+                        "errorCode": exc.code,
+                        "model": start.config.model_name,
+                    },
+                },
+            )
             yield {"type": "error", "message": exc.message}
             return
         except Exception:

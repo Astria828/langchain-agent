@@ -397,3 +397,160 @@ def test_main_connection_ignores_reasoning_only_response() -> None:
             )
         )
     assert error.value.code == "MODEL_OUTPUT_INVALID"
+
+
+def test_chat_completion_stream_sends_response_format_when_requested() -> None:
+    """结构化输出约束只在显式传入时下发，不影响其他调用方的请求体。"""
+
+    captured: dict[str, object] = {}
+    response_format = {"type": "json_schema", "json_schema": {"name": "chat_reply"}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        frames = [
+            'data: {"choices":[{"delta":{"content":"正文"}}]}\n\n',
+            "data: [DONE]\n\n",
+        ]
+        return httpx.Response(200, text="".join(frames))
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+
+    async def collect() -> list[ModelStreamChunk]:
+        return [
+            chunk
+            async for chunk in gateway.stream_chat_completion(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test-main",
+                messages=[{"role": "user", "content": "你好"}],
+                max_tokens=8192,
+                response_format=response_format,
+            )
+        ]
+
+    assert asyncio.run(collect()) == [ModelStreamChunk("content", "正文")]
+    assert captured["payload"] == {
+        "model": "chat-model",
+        "messages": [{"role": "user", "content": "你好"}],
+        "stream": True,
+        "max_tokens": 8192,
+        "response_format": response_format,
+    }
+
+
+def test_chat_completion_stream_retries_without_unsupported_response_format() -> None:
+    """上游拒绝结构化输出字段时退回纯提示词模式，不能让整轮对话失败。"""
+
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        if "response_format" in payload:
+            return httpx.Response(400, json={"error": {"message": "unsupported parameter"}})
+        return httpx.Response(
+            200,
+            text='data: {"choices":[{"delta":{"content":"正文"}}]}\n\ndata: [DONE]\n\n',
+        )
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+
+    async def collect() -> list[ModelStreamChunk]:
+        return [
+            chunk
+            async for chunk in gateway.stream_chat_completion(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test-main",
+                messages=[{"role": "user", "content": "你好"}],
+                response_format={"type": "json_schema", "json_schema": {"name": "chat_reply"}},
+            )
+        ]
+
+    assert asyncio.run(collect()) == [ModelStreamChunk("content", "正文")]
+    assert len(payloads) == 2
+    assert "response_format" in payloads[0]
+    assert "response_format" not in payloads[1]
+
+
+def test_chat_completion_stream_reports_mid_stream_upstream_error() -> None:
+    """HTTP 200 流中间的错误帧按调用失败上报，不能伪装成模型格式错误。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        frames = [
+            'data: {"choices":[{"delta":{"content":"开头"}}]}\n\n',
+            'data: {"error":{"code":429,"message":"Rate limit exceeded"}}\n\n',
+        ]
+        return httpx.Response(200, text="".join(frames))
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+
+    async def collect() -> list[ModelStreamChunk]:
+        return [
+            chunk
+            async for chunk in gateway.stream_chat_completion(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test-main",
+                messages=[{"role": "user", "content": "你好"}],
+            )
+        ]
+
+    with pytest.raises(AppError) as error:
+        asyncio.run(collect())
+
+    assert error.value.code == "MODEL_CONNECTION_FAILED"
+    assert "Rate limit exceeded" in error.value.message
+
+
+def test_upstream_error_body_never_echoes_credentials() -> None:
+    """错误正文里的 Key 与鉴权失败描述都不能进入业务错误。"""
+
+    secret = "sk-sensitive-upstream-key"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        frames = [
+            f'data: {{"error":{{"code":401,"message":"invalid key {secret}"}}}}\n\n',
+        ]
+        return httpx.Response(200, text="".join(frames))
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+
+    async def collect() -> list[ModelStreamChunk]:
+        return [
+            chunk
+            async for chunk in gateway.stream_chat_completion(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key=secret,
+                messages=[{"role": "user", "content": "你好"}],
+            )
+        ]
+
+    with pytest.raises(AppError) as error:
+        asyncio.run(collect())
+
+    assert error.value.code == "MODEL_CONNECTION_FAILED"
+    assert secret not in error.value.message
+    assert "invalid key" not in error.value.message
+
+
+def test_non_streaming_call_rejects_error_body_returned_with_http_200() -> None:
+    """网关在 200 响应体里回报的上游错误不能被当成可解析结果。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": {"message": "Insufficient credits"}})
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+    with pytest.raises(AppError) as error:
+        asyncio.run(
+            gateway.create_chat_completion(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test-main",
+                messages=[{"role": "user", "content": "原文"}],
+            )
+        )
+
+    assert error.value.code == "MODEL_CONNECTION_FAILED"
+    assert "Insufficient credits" in error.value.message

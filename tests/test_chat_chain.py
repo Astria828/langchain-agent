@@ -114,3 +114,56 @@ def test_stream_blocks_discards_reasoning_without_breaking_json_parsing() -> Non
     assert [(block.type, block.content) for block in blocks] == [
         ("action", "她抬起头。")
     ]
+
+
+class RecordingGateway(StubGateway):
+    """在 StubGateway 基础上记录完整请求参数。"""
+
+    def __init__(self, chunks: list[str]) -> None:
+        super().__init__(chunks)
+        self.kwargs: dict = {}
+
+    async def stream_chat_completion(self, **kwargs):
+        """记录结构化输出约束等调用参数后复用父类分片。"""
+
+        self.kwargs = kwargs
+        self.messages = kwargs["messages"]
+        for chunk in self.chunks:
+            yield chunk if isinstance(chunk, ModelStreamChunk) else ModelStreamChunk(
+                "content", chunk
+            )
+
+
+def test_basic_chat_stream_constrains_upstream_with_reply_json_schema() -> None:
+    """对话请求下发严格 JSON Schema 与输出上限，不再只靠提示词约束格式。"""
+
+    gateway = RecordingGateway(['{"blocks":[{"type":"action","content":"她抬起头。"}]}'])
+
+    collect_blocks(gateway)
+
+    response_format = gateway.kwargs["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["additionalProperties"] is False
+    block_schema = schema["properties"]["blocks"]["items"]
+    assert block_schema["additionalProperties"] is False
+    assert block_schema["properties"]["type"]["enum"] == ["action", "dialogue"]
+    assert sorted(block_schema["required"]) == ["content", "type"]
+    assert gateway.kwargs["max_tokens"] > 0
+
+
+@pytest.mark.parametrize(
+    "raw_response",
+    [
+        '好的，以下是回复：\n{"blocks":[{"type":"action","content":"她抬起头。"}]}',
+        '{"blocks":[{"type":"action","content":"她抬起头。"},]}',
+        '```json\n{"blocks":[{"type":"action","content":"她抬起头。"}]}\n```\n如需调整请告知。',
+    ],
+)
+def test_basic_chat_stream_tolerates_wrapping_around_valid_blocks(raw_response: str) -> None:
+    """已逐块校验通过的内容块，不因 JSON 前后的赘余文本被整条判废。"""
+
+    blocks = collect_blocks(StubGateway([raw_response]))
+
+    assert [(block.type, block.content) for block in blocks] == [("action", "她抬起头。")]

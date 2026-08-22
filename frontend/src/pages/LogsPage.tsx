@@ -40,7 +40,7 @@ export default function LogsPage() {
   const refreshLogs = useAppStore((s) => s.refreshLogs);
   const clearLogs = useAppStore((s) => s.clearLogs);
   const flash = useAppStore((s) => s.flash);
-  const [pendingDelete, setPendingDelete] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<'filtered' | 'all' | null>(null);
 
   useEffect(() => {
     void refreshLogs();
@@ -95,10 +95,17 @@ export default function LogsPage() {
               </button>
               <button
                 className="btn-dim-danger"
-                onClick={() => setPendingDelete(true)}
+                onClick={() => setPendingDelete('filtered')}
                 style={{ fontSize: 12.5, padding: '8px 16px' }}
               >
                 删除筛选结果
+              </button>
+              <button
+                className="btn-dim-danger"
+                onClick={() => setPendingDelete('all')}
+                style={{ fontSize: 12.5, padding: '8px 16px' }}
+              >
+                清空全部
               </button>
             </div>
           }
@@ -106,13 +113,18 @@ export default function LogsPage() {
 
         {pendingDelete && (
           <ConfirmInline
-            text={`确定删除当前筛选条件下的 ${logs.length} 条日志？此操作不可恢复。`}
+            text={
+              pendingDelete === 'all'
+                ? '确定清空全部日志？包括当前筛选之外的所有记录，此操作不可恢复。'
+                : `确定删除当前筛选条件下的 ${logs.length} 条日志？此操作不可恢复。`
+            }
             layout="inline"
             onConfirm={() => {
-              setPendingDelete(false);
-              void clearLogs();
+              const scope = pendingDelete;
+              setPendingDelete(null);
+              void clearLogs(scope);
             }}
-            onCancel={() => setPendingDelete(false)}
+            onCancel={() => setPendingDelete(null)}
             style={{ marginTop: 20 }}
           />
         )}

@@ -137,7 +137,8 @@ interface AppState {
   setLogLevel: (level: LogLevel | 'all') => void;
   setLogRange: (range: LogRange) => void;
   refreshLogs: () => Promise<void>;
-  clearLogs: () => Promise<void>;
+  /** filtered：删除当前筛选命中的日志；all：无视筛选清空全部 */
+  clearLogs: (scope?: 'filtered' | 'all') => Promise<void>;
 }
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : '操作失败');
@@ -874,16 +875,19 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ logsLoading: false });
     }
   },
-  clearLogs: async () => {
-    const query: LogQuery = { level: get().logLevel, range: get().logRange };
+  clearLogs: async (scope = 'filtered') => {
+    const query: LogQuery =
+      scope === 'all'
+        ? { level: 'all', range: 'all' }
+        : { level: get().logLevel, range: get().logRange };
     try {
       const { count } = await client.deleteLogs(query);
       await get().refreshLogs();
       if (!count) {
-        get().flash('当前筛选条件下没有日志');
+        get().flash(scope === 'all' ? '日志已经是空的' : '当前筛选条件下没有日志');
         return;
       }
-      get().flash(`已删除 ${count} 条日志`);
+      get().flash(scope === 'all' ? `已清空全部日志 · 共 ${count} 条` : `已删除 ${count} 条日志`);
     } catch (err) {
       get().flash(errText(err));
     }

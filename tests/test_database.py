@@ -20,8 +20,6 @@ EXPECTED_TABLES = {
     "message_blocks",
     "messages",
     "model_configs",
-    "session_context_snapshots",
-    "session_world_book_entry_snapshots",
     "sessions",
     "user_identities",
     "world_book_entries",
@@ -101,6 +99,26 @@ def test_migration_schema_matches_sqlalchemy_metadata(tmp_path: Path) -> None:
         }
         model_columns = {column.name for column in table.columns}
         assert migration_columns == model_columns
+
+        # 外键的 ON DELETE 动作是业务规则的一部分（谁能删、删了怎么办），
+        # 只比列名的话 schema 与模型可以长期各说各话。
+        migration_fks = {
+            (
+                tuple(fk["constrained_columns"]),
+                fk["referred_table"],
+                (fk.get("options") or {}).get("ondelete"),
+            )
+            for fk in inspector.get_foreign_keys(table_name)
+        }
+        model_fks = {
+            (
+                tuple(element.parent.name for element in constraint.elements),
+                constraint.elements[0].column.table.name,
+                constraint.ondelete,
+            )
+            for constraint in table.foreign_key_constraints
+        }
+        assert migration_fks == model_fks, table_name
 
     engine.dispose()
 
@@ -194,5 +212,130 @@ def test_foreign_keys_and_check_constraints_are_enforced(tmp_path: Path) -> None
                     "(group_name, updated_at) VALUES ('other', 'now')"
                 )
             )
+
+    engine.dispose()
+
+
+def test_drop_snapshot_migration_schedules_vector_cleanup(tmp_path: Path) -> None:
+    """删除快照表前为每条快照登记向量清理任务，并真正落库。"""
+
+    settings = isolated_settings(tmp_path)
+    config = build_alembic_config(settings)
+    # 停在快照表仍然存在的那一版，构造真实待迁移数据
+    command.upgrade(config, "c3f8a91d2e74")
+    engine = create_database_engine(settings)
+
+    with engine.connect() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO characters "
+                "(id, name, introduction, system_prompt, dialogue_examples_json, "
+                "created_at, updated_at) "
+                "VALUES ('character-1', '艾拉', '', '', '[]', 'now', 'now')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions "
+                "(id, title, character_id, round_count, consolidated_round, "
+                "summary, created_at, updated_at) "
+                "VALUES ('session-1', '测试', 'character-1', 0, 0, '', 'now', 'now')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO session_context_snapshots "
+                "(id, session_id, identity_source_id, identity_name, "
+                "identity_persona_name, identity_bio, character_source_id, "
+                "character_name, character_introduction, character_system_prompt, "
+                "character_dialogue_examples_json, created_at) "
+                "VALUES ('context-1', 'session-1', 'identity-1', '用户', '旅人', '', "
+                "'character-1', '艾拉', '', '', '[]', 'now')"
+            )
+        )
+        for position, snapshot_id in enumerate(("snapshot-1", "snapshot-2")):
+            connection.execute(
+                text(
+                    "INSERT INTO session_world_book_entry_snapshots "
+                    "(id, context_snapshot_id, source_entry_id, position, name, "
+                    "content, keywords_json, category, resident, index_status, "
+                    "content_hash, created_at) "
+                    "VALUES (:id, 'context-1', :source, :position, '银港', '正文', "
+                    "'[]', '地点', 0, 'ready', 'hash', 'now')"
+                ),
+                {
+                    "id": snapshot_id,
+                    "source": f"entry-{position}",
+                    "position": position,
+                },
+            )
+        connection.commit()
+    engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = create_database_engine(settings)
+    inspector = inspect(engine)
+    assert "session_context_snapshots" not in inspector.get_table_names()
+    assert "session_world_book_entry_snapshots" not in inspector.get_table_names()
+
+    with engine.connect() as connection:
+        scope_ids = set(
+            connection.execute(
+                text(
+                    "SELECT scope_id FROM background_tasks "
+                    "WHERE task_type = 'vector_cleanup' AND status = 'pending'"
+                )
+            ).scalars()
+        )
+    assert scope_ids == {"session-entry:snapshot-1", "session-entry:snapshot-2"}
+    engine.dispose()
+
+
+def test_deleting_world_book_degrades_sessions_instead_of_being_rejected(
+    tmp_path: Path,
+) -> None:
+    """世界书被删除时，引用它的会话由数据库降级为无世界书而不是拒绝删除。"""
+
+    settings = isolated_settings(tmp_path)
+    initialize_database(settings)
+    engine = create_database_engine(settings)
+
+    with engine.connect() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO characters "
+                "(id, name, introduction, system_prompt, dialogue_examples_json, "
+                "created_at, updated_at) "
+                "VALUES ('character-1', '艾拉', '', '', '[]', 'now', 'now')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO world_books (id, name, raw_content, created_at, updated_at) "
+                "VALUES ('book-1', '魔法人偶', '原文', 'now', 'now')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions "
+                "(id, title, character_id, world_book_id, round_count, "
+                "consolidated_round, summary, created_at, updated_at) "
+                "VALUES ('session-1', '测试', 'character-1', 'book-1', 0, 0, '', 'now', 'now')"
+            )
+        )
+        connection.commit()
+
+        connection.execute(text("DELETE FROM world_books WHERE id = 'book-1'"))
+        connection.commit()
+
+        assert connection.execute(
+            text("SELECT world_book_id FROM sessions WHERE id = 'session-1'")
+        ).scalar() is None
+
+        # 角色卡是非空绑定，仍应拒绝删除
+        with pytest.raises(IntegrityError):
+            connection.execute(text("DELETE FROM characters WHERE id = 'character-1'"))
+        connection.rollback()
 
     engine.dispose()

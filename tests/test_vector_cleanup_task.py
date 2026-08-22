@@ -10,11 +10,9 @@ from app.db.models import BackgroundTask
 from app.main import create_app
 from app.repositories.chroma_repository import (
     memory_document_id,
-    session_entry_document_id,
     worldbook_entry_document_id,
 )
 from app.tasks.vector_cleanup_task import (
-    SESSION_ENTRY_CLEANUP_MESSAGE,
     VectorCleanupTask,
     recover_interrupted_vector_cleanup_tasks,
     run_pending_vector_cleanup_tasks,
@@ -75,13 +73,6 @@ def test_cleanup_runner_routes_collections_and_normalizes_legacy_task(
                     scope_id=memory_document_id("memory-1"),
                     progress_total=1,
                 ),
-                BackgroundTask(
-                    task_type="vector_cleanup",
-                    status="pending",
-                    scope_id="snapshot-legacy",
-                    progress_total=1,
-                    error_message=SESSION_ENTRY_CLEANUP_MESSAGE,
-                ),
             ]
             session.add_all(tasks)
             session.commit()
@@ -91,20 +82,13 @@ def test_cleanup_runner_routes_collections_and_normalizes_legacy_task(
         asyncio.run(run_pending_vector_cleanup_tasks(settings, chroma))
 
         # 同毫秒创建的任务由随机 UUID 次级排序，业务只要求目标完整且路由正确。
-        assert sorted(chroma.worldbook_ids) == sorted(
-            [
-                worldbook_entry_document_id("entry-1"),
-                session_entry_document_id("snapshot-legacy"),
-            ]
-        )
+        assert chroma.worldbook_ids == [worldbook_entry_document_id("entry-1")]
         assert chroma.memory_ids == [memory_document_id("memory-1")]
         with session_factory() as session:
             refreshed = [session.get(BackgroundTask, task_id) for task_id in task_ids]
             assert all(
                 task is not None and task.status == "succeeded" for task in refreshed
             )
-            assert refreshed[2] is not None
-            assert refreshed[2].scope_id == session_entry_document_id("snapshot-legacy")
     finally:
         engine.dispose()
 
@@ -126,9 +110,8 @@ def test_cleanup_failure_is_sanitized_and_interrupted_task_can_resume(
             interrupted = BackgroundTask(
                 task_type="vector_cleanup",
                 status="running",
-                scope_id="snapshot-interrupted",
+                scope_id=worldbook_entry_document_id("entry-interrupted"),
                 progress_total=1,
-                error_message=SESSION_ENTRY_CLEANUP_MESSAGE,
             )
             session.add_all([failed, interrupted])
             session.commit()
@@ -149,7 +132,7 @@ def test_cleanup_failure_is_sanitized_and_interrupted_task_can_resume(
             session.expire_all()
             resumed = session.get(BackgroundTask, interrupted.id)
             assert resumed is not None and resumed.status == "succeeded"
-            assert resumed.scope_id == session_entry_document_id("snapshot-interrupted")
+            assert resumed.scope_id == worldbook_entry_document_id("entry-interrupted")
     finally:
         engine.dispose()
 

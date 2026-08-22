@@ -6,7 +6,11 @@ import json
 import httpx
 import pytest
 from app.core.exceptions import AppError
-from app.gateways.model_gateway import ModelGateway, normalize_base_url
+from app.gateways.model_gateway import (
+    ModelGateway,
+    ModelStreamChunk,
+    normalize_base_url,
+)
 
 
 def stream_response(*contents: str) -> httpx.Response:
@@ -46,7 +50,6 @@ def test_main_connection_uses_openai_compatible_contract() -> None:
             "model": "chat-model",
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 1,
-            "temperature": 0,
             "stream": True,
         },
     }
@@ -156,12 +159,50 @@ def test_chat_completion_stream_returns_only_ordered_content_deltas() -> None:
             )
         ]
 
-    assert asyncio.run(collect()) == ["前半", "后半"]
+    assert asyncio.run(collect()) == [
+        ModelStreamChunk("content", "前半"),
+        ModelStreamChunk("content", "后半"),
+    ]
     assert captured["payload"] == {
         "model": "chat-model",
         "messages": [{"role": "user", "content": "你好"}],
-        "temperature": 0,
         "stream": True,
+    }
+
+
+def test_chat_completion_stream_sends_temperature_only_when_requested() -> None:
+    """显式传入采样温度时才写入请求体，供抽取类调用固定为确定性输出。"""
+
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        frames = [
+            'data: {"choices":[{"delta":{"content":"正文"}}]}\n\n',
+            "data: [DONE]\n\n",
+        ]
+        return httpx.Response(200, text="".join(frames))
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+
+    async def collect() -> list[str]:
+        return [
+            chunk
+            async for chunk in gateway.stream_chat_completion(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test-main",
+                messages=[{"role": "user", "content": "你好"}],
+                temperature=0,
+            )
+        ]
+
+    assert asyncio.run(collect()) == [ModelStreamChunk("content", "正文")]
+    assert captured["payload"] == {
+        "model": "chat-model",
+        "messages": [{"role": "user", "content": "你好"}],
+        "stream": True,
+        "temperature": 0,
     }
 
 
@@ -302,3 +343,57 @@ def test_base_url_rejects_unsupported_or_secret_bearing_urls(base_url: str) -> N
 
     with pytest.raises(ValueError):
         normalize_base_url(base_url)
+
+
+def test_chat_completion_stream_forwards_reasoning_before_content() -> None:
+    """推理增量按上游顺序转发，且与正文严格区分。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        frames = [
+            'data: {"choices":[{"delta":{"reasoning":"先想一下"}}]}\n\n',
+            'data: {"choices":[{"delta":{"reasoning_content":"再想一下"}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":"正文"}}]}\n\n',
+            "data: [DONE]\n\n",
+        ]
+        return httpx.Response(200, text="".join(frames))
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+
+    async def collect() -> list[ModelStreamChunk]:
+        return [
+            chunk
+            async for chunk in gateway.stream_chat_completion(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test-main",
+                messages=[{"role": "user", "content": "你好"}],
+            )
+        ]
+
+    assert asyncio.run(collect()) == [
+        ModelStreamChunk("reasoning", "先想一下"),
+        ModelStreamChunk("reasoning", "再想一下"),
+        ModelStreamChunk("content", "正文"),
+    ]
+
+
+def test_main_connection_ignores_reasoning_only_response() -> None:
+    """只有推理没有正文时仍判定为主模型输出无效。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        frames = [
+            'data: {"choices":[{"delta":{"reasoning":"只思考不作答"}}]}\n\n',
+            "data: [DONE]\n\n",
+        ]
+        return httpx.Response(200, text="".join(frames))
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+    with pytest.raises(AppError) as error:
+        asyncio.run(
+            gateway.test_main(
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test-main",
+            )
+        )
+    assert error.value.code == "MODEL_OUTPUT_INVALID"

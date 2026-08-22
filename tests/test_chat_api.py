@@ -13,6 +13,7 @@ from app.db.database import (
     get_db_session,
 )
 from app.db.models import BackgroundTask, ChatSession, LongTermMemory, ModelConfig
+from app.gateways.model_gateway import ModelStreamChunk
 from app.main import create_app
 from app.repositories.chroma_repository import (
     calculate_content_hash,
@@ -45,11 +46,12 @@ class UnusedGateway:
     async def stream_chat_completion(self, **_kwargs):
         """返回两块确定的基础角色回复。"""
 
-        yield (
+        yield ModelStreamChunk(
+            "content",
             '{"blocks":['
             '{"type":"action","content":"她看向门口。"},'
             '{"type":"dialogue","content":"欢迎回来。"}'
-            "]}"
+            "]}",
         )
 
 
@@ -144,7 +146,6 @@ def test_session_api_uses_real_character_and_world_book_ids(tmp_path: Path) -> N
         created = created_response.json()["data"]
         assert created["characterId"] == character["id"]
         assert created["worldBookId"] == world_book["id"]
-        assert created["identitySnapshotId"]
         assert created["identityName"] == identity["name"]
         assert created["identityPersonaName"] == identity["personaName"]
         assert created["characterName"] == "Isra"
@@ -159,11 +160,11 @@ def test_session_api_uses_real_character_and_world_book_ids(tmp_path: Path) -> N
         client.put(
             f"/api/worldbooks/{world_book['id']}", json={"name": "修改后的世界书"}
         )
-        archived = client.get("/api/sessions").json()["data"][0]
-        assert archived["identityName"] == "Strand"
-        assert archived["identityPersonaName"] == "master"
-        assert archived["characterName"] == "Isra"
-        assert archived["worldBookName"] == "魔法人偶"
+        # 会话不再冻结上下文，改名后已有会话立即反映最新绑定
+        refreshed = client.get("/api/sessions").json()["data"][0]
+        assert refreshed["identityName"] == "修改后的身份"
+        assert refreshed["characterName"] == "修改后的角色"
+        assert refreshed["worldBookName"] == "修改后的世界书"
 
         second = client.post(
             "/api/sessions",

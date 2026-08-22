@@ -7,7 +7,10 @@ from collections.abc import AsyncIterator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DatabaseSession
 
-from app.chains.chat_chain import build_recommended_reply_chain, stream_basic_chat_blocks
+from app.chains.chat_chain import (
+    build_recommended_reply_chain,
+    stream_basic_chat_blocks,
+)
 from app.core.exceptions import AppError
 from app.core.security import unprotect_api_key
 from app.db.models import (
@@ -16,8 +19,6 @@ from app.db.models import (
     ChatSession,
     LongTermMemory,
     ModelConfig,
-    SessionContextSnapshot,
-    SessionWorldBookEntrySnapshot,
     UserIdentity,
     WorldBook,
     WorldBookEntry,
@@ -25,13 +26,8 @@ from app.db.models import (
 )
 from app.db.models import Message as MessageModel
 from app.db.models import MessageBlock as MessageBlockModel
-from app.gateways.model_gateway import ModelGateway
-from app.repositories.chroma_repository import (
-    ChromaRepository,
-    build_worldbook_index_text,
-    calculate_content_hash,
-    session_entry_document_id,
-)
+from app.gateways.model_gateway import ModelGateway, ModelStreamChunk
+from app.repositories.chroma_repository import ChromaRepository, calculate_content_hash
 from app.repositories.sqlite_repository import SQLiteRepository
 from app.retrievers.memory_retriever import MemoryRetriever
 from app.retrievers.worldbook_retriever import WorldBookRetriever
@@ -49,10 +45,47 @@ from app.schemas.dto import (
 
 logger = logging.getLogger(__name__)
 RETRIEVAL_HISTORY_ROUNDS = 4
+# 角色卡被删时会话仍应可读；绑定被 RESTRICT 外键保护，正常路径到不了这里。
+DELETED_CHARACTER_NAME = "已删除角色卡"
+# 推理增量攒到这个长度才发一帧 SSE，避免前端逐 token 重渲染。
+THINKING_FLUSH_CHARS = 40
 CONTINUE_REPLY_INSTRUCTION = (
     "继续上一条角色回复，从结束处自然续写。"
     "不要重复已有内容，也不要假设用户产生了新的动作或台词。"
 )
+
+
+def session_to_dto(
+    repository: SQLiteRepository,
+    chat_session: ChatSession,
+    identity: UserIdentity,
+) -> Session:
+    """按当前身份、角色卡与世界书绑定组装会话公开 DTO。
+
+    会话 API 与系统导出共用这一份解析规则，避免两处各自拼字段后逐渐漂移。
+    """
+
+    character = repository.get(Character, chat_session.character_id)
+    world_book = (
+        repository.get(WorldBook, chat_session.world_book_id)
+        if chat_session.world_book_id is not None
+        else None
+    )
+    return Session(
+        id=chat_session.id,
+        title=chat_session.title,
+        character_id=chat_session.character_id,
+        world_book_id=chat_session.world_book_id,
+        identity_name=identity.name,
+        identity_persona_name=identity.persona_name,
+        character_name=character.name if character is not None else DELETED_CHARACTER_NAME,
+        world_book_name=world_book.name if world_book is not None else None,
+        round_count=chat_session.round_count,
+        consolidated_round=chat_session.consolidated_round,
+        summary=chat_session.summary,
+        created_at=chat_session.created_at,
+        updated_at=chat_session.updated_at,
+    )
 
 
 class ChatService:
@@ -76,12 +109,14 @@ class ChatService:
             ChatSession,
             order_by=(ChatSession.updated_at.desc(), ChatSession.id),
         )
-        return [self._session_to_dto(chat_session) for chat_session in sessions]
+        identity = self._get_current_identity()
+        return [
+            self._session_to_dto(chat_session, identity=identity) for chat_session in sessions
+        ]
 
     async def create_session(self, payload: CreateSessionPayload) -> Session:
-        """创建固定绑定和快照，提交后再准备可重建的会话世界书向量。"""
+        """创建会话与角色、世界书的实时绑定，并写入可选开场白。"""
 
-        identity = self._get_current_identity()
         character = self.repository.get(Character, payload.character_id)
         if character is None:
             raise AppError(
@@ -112,50 +147,8 @@ class ChatService:
         )
         self.repository.flush()
 
-        context_snapshot = self.repository.add(
-            SessionContextSnapshot(
-                session_id=chat_session.id,
-                identity_source_id=identity.id,
-                identity_name=identity.name,
-                identity_persona_name=identity.persona_name,
-                identity_bio=identity.bio,
-                character_source_id=character.id,
-                character_name=character.name,
-                character_introduction=character.introduction,
-                character_system_prompt=character.system_prompt,
-                character_dialogue_examples_json=character.dialogue_examples_json,
-                world_book_source_id=world_book.id if world_book is not None else None,
-                world_book_name=world_book.name if world_book is not None else None,
-                world_book_raw_content=(world_book.raw_content if world_book is not None else None),
-            )
-        )
-        self.repository.flush()
-
-        entry_snapshots = self._copy_enabled_world_book_entries(
-            context_snapshot,
-            world_book,
-        )
         self._create_opening_message(chat_session, character)
         self.session.commit()
-
-        if entry_snapshots:
-            try:
-                await self._index_entry_snapshots(chat_session, world_book, entry_snapshots)
-            except AppError as exc:
-                self._mark_snapshot_index_failure(entry_snapshots, exc.message)
-                logger.warning(
-                    "会话世界书快照索引失败 session_id=%s code=%s",
-                    chat_session.id,
-                    exc.code,
-                    extra={
-                        "event": "session_snapshot_index_failed",
-                        "business_ids": {
-                            "sessionId": chat_session.id,
-                            "errorCode": exc.code,
-                        },
-                    },
-                )
-
         return self._session_to_dto(chat_session)
 
     def update_session(
@@ -163,7 +156,7 @@ class ChatService:
         session_id: str,
         payload: UpdateSessionPayload,
     ) -> Session:
-        """仅修改会话标题，不改变角色、世界书或任何快照。"""
+        """仅修改会话标题，不改变角色或世界书绑定。"""
 
         chat_session = self._get_session_model(session_id)
         chat_session.title = payload.title
@@ -172,22 +165,11 @@ class ChatService:
         return self._session_to_dto(chat_session)
 
     def delete_session(self, session_id: str) -> None:
-        """删除会话事实，并在提交后清理该会话全部快照向量。"""
+        """删除会话事实；世界书向量由正式条目自身持有，无需随会话清理。"""
 
         chat_session = self._get_session_model(session_id)
-        snapshot_ids = list(
-            self.session.scalars(
-                select(SessionWorldBookEntrySnapshot.id)
-                .join(
-                    SessionContextSnapshot,
-                    SessionContextSnapshot.id == SessionWorldBookEntrySnapshot.context_snapshot_id,
-                )
-                .where(SessionContextSnapshot.session_id == session_id)
-            ).all()
-        )
         self.repository.delete(chat_session)
         self.session.commit()
-        self._delete_snapshot_vectors_or_schedule(snapshot_ids)
 
     def list_messages(self, session_id: str) -> list[Message]:
         """按数据库稳定位置返回会话的完整历史消息与有序内容块。"""
@@ -231,7 +213,7 @@ class ChatService:
             session_id,
             assistant_message_id,
         )
-        context_snapshot = self._get_context_snapshot(session_id)
+        identity, character = self._get_session_context(chat_session)
         config, api_key = self._require_main_model_config()
         embedding_config = self._get_embedding_config()
         if embedding_config.rebuild_required:
@@ -257,7 +239,8 @@ class ChatService:
             current_input=(
                 current_input if action == "regenerate" else CONTINUE_REPLY_INSTRUCTION
             ),
-            context_snapshot=context_snapshot,
+            identity=identity,
+            character=character,
             worldbook_entries=worldbook_entries,
             memories=memories,
             excluded_message_ids=excluded_message_ids,
@@ -271,10 +254,10 @@ class ChatService:
         )
 
     async def generate_recommended_reply(self, session_id: str) -> RecommendedReplyOutput:
-        """基于固定快照和最近二十轮生成一条不落库的用户回复建议。"""
+        """基于当前身份、角色卡和最近二十轮生成一条不落库的用户回复建议。"""
 
-        self._get_session_model(session_id)
-        context_snapshot = self._get_context_snapshot(session_id)
+        chat_session = self._get_session_model(session_id)
+        identity, character = self._get_session_context(chat_session)
         latest_message = self.session.scalar(
             select(MessageModel)
             .where(MessageModel.session_id == session_id)
@@ -300,7 +283,7 @@ class ChatService:
             ).all()
         )
         history.reverse()
-        messages = self._build_fixed_context_messages(context_snapshot)
+        messages = self._build_fixed_context_messages(identity, character)
         messages.extend(self._history_message_to_model(message) for message in history)
         chain = build_recommended_reply_chain(
             gateway=self.gateway,
@@ -334,11 +317,7 @@ class ChatService:
         """在建立 SSE 前保存用户原文、执行双 RAG 并返回完整上下文。"""
 
         chat_session = self._get_session_model(session_id)
-        context_snapshot = self.session.scalar(
-            select(SessionContextSnapshot).where(SessionContextSnapshot.session_id == session_id)
-        )
-        if context_snapshot is None:
-            raise RuntimeError("会话缺少上下文快照")
+        identity, character = self._get_session_context(chat_session)
         config, api_key = self._require_main_model_config()
         embedding_config = self._get_embedding_config()
         if embedding_config.rebuild_required:
@@ -412,7 +391,8 @@ class ChatService:
             session_id=session_id,
             current_user_message_id=user_message.id,
             current_input=payload.content,
-            context_snapshot=context_snapshot,
+            identity=identity,
+            character=character,
             worldbook_entries=worldbook_entries,
             memories=memories,
         )
@@ -440,17 +420,13 @@ class ChatService:
 
         blocks: list[ChatReplyBlock] = []
         try:
-            async for block in stream_basic_chat_blocks(
-                gateway=self.gateway,
-                base_url=config.base_url,
-                model=config.model_name,
-                api_key=api_key,
+            async for event in self._stream_reply_events(
                 messages=messages,
+                config=config,
+                api_key=api_key,
+                blocks=blocks,
             ):
-                sequence = len(blocks)
-                blocks.append(block)
-                for event in self._block_stream_events(block, sequence):
-                    yield event
+                yield event
             output = ChatReplyOutput(blocks=blocks)
             assistant_message, round_count = self._save_assistant_reply(
                 session_id,
@@ -509,17 +485,13 @@ class ChatService:
             yield {"type": "retrieval", "entries": retrieved_entries}
         blocks: list[ChatReplyBlock] = []
         try:
-            async for block in stream_basic_chat_blocks(
-                gateway=self.gateway,
-                base_url=config.base_url,
-                model=config.model_name,
-                api_key=api_key,
+            async for event in self._stream_reply_events(
                 messages=messages,
+                config=config,
+                api_key=api_key,
+                blocks=blocks,
             ):
-                sequence = len(blocks)
-                blocks.append(block)
-                for event in self._block_stream_events(block, sequence):
-                    yield event
+                yield event
             output = ChatReplyOutput(blocks=blocks)
             if action == "regenerate":
                 assistant_message, round_count = self._replace_assistant_reply(
@@ -564,6 +536,55 @@ class ChatService:
             "roundCount": round_count,
         }
 
+    async def _stream_reply_events(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        config: ModelConfig,
+        api_key: str,
+        blocks: list[ChatReplyBlock],
+    ) -> AsyncIterator[dict[str, object]]:
+        """把 Chain 产出的推理与内容块统一转成 SSE 事件，并把新块追加到 blocks。"""
+
+        # 推理模型一轮可产生数千个增量，逐个成帧会让前端每帧重渲染一次；
+        # 攒够一小段再发，界面观感不变但帧数降一到两个数量级。
+        thinking = ""
+
+        def flush() -> dict[str, object] | None:
+            nonlocal thinking
+            if not thinking:
+                return None
+            event = {"type": "thinking", "text": thinking}
+            thinking = ""
+            return event
+
+        async for item in stream_basic_chat_blocks(
+            gateway=self.gateway,
+            base_url=config.base_url,
+            model=config.model_name,
+            api_key=api_key,
+            messages=messages,
+        ):
+            if isinstance(item, ModelStreamChunk):
+                thinking += item.text
+                if len(thinking) >= THINKING_FLUSH_CHARS:
+                    pending = flush()
+                    if pending is not None:
+                        yield pending
+                continue
+            # 正文块到达前先把剩余推理吐干净，保证前端顺序正确
+            pending = flush()
+            if pending is not None:
+                yield pending
+            sequence = len(blocks)
+            blocks.append(item)
+            for event in self._block_stream_events(item, sequence):
+                yield event
+
+        pending = flush()
+        if pending is not None:
+            yield pending
+
     def _get_current_identity(self) -> UserIdentity:
         """读取单用户当前身份，缺失表示数据库初始化状态损坏。"""
 
@@ -606,15 +627,18 @@ class ChatService:
             )
         return chat_session
 
-    def _get_context_snapshot(self, session_id: str) -> SessionContextSnapshot:
-        """读取会话唯一上下文快照，缺失表示数据库状态损坏。"""
+    def _get_session_context(self, chat_session: ChatSession) -> tuple[UserIdentity, Character]:
+        """读取会话当前绑定的用户身份与角色卡的最新内容。"""
 
-        context_snapshot = self.session.scalar(
-            select(SessionContextSnapshot).where(SessionContextSnapshot.session_id == session_id)
-        )
-        if context_snapshot is None:
-            raise RuntimeError("会话缺少上下文快照")
-        return context_snapshot
+        identity = self._get_current_identity()
+        character = self.repository.get(Character, chat_session.character_id)
+        if character is None:
+            raise AppError(
+                status_code=404,
+                code="RESOURCE_NOT_FOUND",
+                message="会话绑定的角色卡已被删除",
+            )
+        return identity, character
 
     def _get_mutable_last_turn(
         self,
@@ -747,7 +771,7 @@ class ChatService:
         current_user_message_id: str,
         current_input: str,
         embedding_config: ModelConfig,
-    ) -> tuple[list[SessionWorldBookEntrySnapshot], list[LongTermMemory]]:
+    ) -> tuple[list[WorldBookEntry], list[LongTermMemory]]:
         """为已有用户轮次复用双 RAG 检索流程。"""
 
         embedding_version = embedding_config.config_version
@@ -797,7 +821,7 @@ class ChatService:
         current_input: str,
         query_embedding: list[float] | None,
         embedding_version: int,
-    ) -> list[SessionWorldBookEntrySnapshot]:
+    ) -> list[WorldBookEntry]:
         """执行世界书混合召回，向量查询失败时保留常驻和关键词结果。"""
 
         retriever = WorldBookRetriever(self.session, self.chroma)
@@ -870,43 +894,6 @@ class ChatService:
             )
         return memories
 
-    def _copy_enabled_world_book_entries(
-        self,
-        context_snapshot: SessionContextSnapshot,
-        world_book: WorldBook | None,
-    ) -> list[SessionWorldBookEntrySnapshot]:
-        """把创建时已启用的正式条目复制为不可变会话快照。"""
-
-        if world_book is None:
-            return []
-        entries = self.session.scalars(
-            select(WorldBookEntry)
-            .where(
-                WorldBookEntry.world_book_id == world_book.id,
-                WorldBookEntry.enabled == 1,
-            )
-            .order_by(WorldBookEntry.position, WorldBookEntry.id)
-        ).all()
-        snapshots: list[SessionWorldBookEntrySnapshot] = []
-        for entry in entries:
-            snapshot = SessionWorldBookEntrySnapshot(
-                context_snapshot_id=context_snapshot.id,
-                source_entry_id=entry.id,
-                position=entry.position,
-                name=entry.name,
-                content=entry.content,
-                keywords_json=entry.keywords_json,
-                category=entry.category,
-                resident=entry.resident,
-                index_status="pending",
-                embedding_version=None,
-                content_hash=self._calculate_snapshot_hash(entry),
-            )
-            self.repository.add(snapshot)
-            snapshots.append(snapshot)
-        self.repository.flush()
-        return snapshots
-
     def _create_opening_message(
         self,
         chat_session: ChatSession,
@@ -942,14 +929,15 @@ class ChatService:
         session_id: str,
         current_user_message_id: str,
         current_input: str,
-        context_snapshot: SessionContextSnapshot,
-        worldbook_entries: list[SessionWorldBookEntrySnapshot],
+        identity: UserIdentity,
+        character: Character,
+        worldbook_entries: list[WorldBookEntry],
         memories: list[LongTermMemory],
         excluded_message_ids: tuple[str, ...] | None = None,
     ) -> list[dict[str, str]]:
         """按身份、角色、双 RAG、短期历史和当前输入的固定顺序组装上下文。"""
 
-        messages = self._build_fixed_context_messages(context_snapshot)
+        messages = self._build_fixed_context_messages(identity, character)
         excluded_ids = (
             (current_user_message_id,)
             if excluded_message_ids is None
@@ -1008,11 +996,12 @@ class ChatService:
 
     @staticmethod
     def _build_fixed_context_messages(
-        context_snapshot: SessionContextSnapshot,
+        identity: UserIdentity,
+        character: Character,
     ) -> list[dict[str, str]]:
-        """构造角色回复和用户推荐共同使用的固定身份、角色快照。"""
+        """构造角色回复和用户推荐共同使用的当前身份、角色卡上下文。"""
 
-        examples = json.loads(context_snapshot.character_dialogue_examples_json)
+        examples = json.loads(character.dialogue_examples_json)
         examples_text = "\n".join(
             f"用户示例：{example['user']}\n角色示例：{example['assistant']}" for example in examples
         )
@@ -1020,19 +1009,19 @@ class ChatService:
             {
                 "role": "system",
                 "content": (
-                    "用户身份快照：\n"
-                    f"姓名：{context_snapshot.identity_name}\n"
-                    f"身份名称：{context_snapshot.identity_persona_name}\n"
-                    f"用户设定：{context_snapshot.identity_bio}"
+                    "用户身份：\n"
+                    f"姓名：{identity.name}\n"
+                    f"身份名称：{identity.persona_name}\n"
+                    f"用户设定：{identity.bio}"
                 ),
             },
             {
                 "role": "system",
                 "content": (
-                    "角色卡快照：\n"
-                    f"名称：{context_snapshot.character_name}\n"
-                    f"简介：{context_snapshot.character_introduction}\n"
-                    f"角色规则：{context_snapshot.character_system_prompt}\n"
+                    "角色卡：\n"
+                    f"名称：{character.name}\n"
+                    f"简介：{character.introduction}\n"
+                    f"角色规则：{character.system_prompt}\n"
                     f"对话示例：\n{examples_text or '无'}"
                 ),
             },
@@ -1302,89 +1291,6 @@ class ChatService:
             )
         )
 
-    async def _index_entry_snapshots(
-        self,
-        chat_session: ChatSession,
-        world_book: WorldBook | None,
-        snapshots: list[SessionWorldBookEntrySnapshot],
-    ) -> None:
-        """为不可变条目快照生成向量，并写入按会话隔离的 metadata。"""
-
-        if world_book is None:
-            return
-        config = self._require_embedding_config()
-        target_version = config.config_version
-        documents = [
-            build_worldbook_index_text(
-                name=snapshot.name,
-                category=snapshot.category,
-                keywords=json.loads(snapshot.keywords_json),
-                content=snapshot.content,
-            )
-            for snapshot in snapshots
-        ]
-        try:
-            api_key = unprotect_api_key(config.secret_ref or "")
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
-            raise AppError(
-                status_code=503,
-                code="MODEL_NOT_CONFIGURED",
-                message="Embedding 模型密钥不可用",
-            ) from exc
-
-        embeddings = await self.gateway.create_embeddings(
-            base_url=config.base_url,
-            model=config.model_name,
-            api_key=api_key,
-            texts=documents,
-            expected_dimension=config.vector_dimension,
-        )
-        self.session.expire_all()
-        snapshot_ids = [snapshot.id for snapshot in snapshots]
-        current_snapshots = self._load_entry_snapshots(snapshot_ids)
-        if self._get_embedding_config().config_version != target_version or len(
-            current_snapshots
-        ) != len(snapshot_ids):
-            self._mark_snapshot_sources_stale(snapshot_ids, "索引配置在向量生成期间发生变化")
-            return
-
-        try:
-            self.chroma.upsert_worldbook(
-                ids=[session_entry_document_id(snapshot.id) for snapshot in current_snapshots],
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=[
-                    {
-                        "sourceKind": "sessionSnapshot",
-                        "entrySnapshotId": snapshot.id,
-                        "sessionId": chat_session.id,
-                        "worldBookId": world_book.id,
-                        "resident": bool(snapshot.resident),
-                        "embeddingVersion": target_version,
-                        "contentHash": snapshot.content_hash,
-                    }
-                    for snapshot in current_snapshots
-                ],
-            )
-        except Exception as exc:
-            raise AppError(
-                status_code=500,
-                code="INDEX_OPERATION_FAILED",
-                message="会话世界书快照向量写入失败",
-            ) from exc
-
-        self.session.expire_all()
-        current_version = self._get_embedding_config().config_version
-        for snapshot in self._load_entry_snapshots(snapshot_ids):
-            if current_version == target_version:
-                snapshot.index_status = "ready"
-                snapshot.embedding_version = target_version
-                snapshot.last_index_error = None
-            else:
-                snapshot.index_status = "stale"
-                snapshot.last_index_error = "索引配置在向量写入期间发生变化"
-        self.session.commit()
-
     def _get_embedding_config(self) -> ModelConfig:
         """读取固定的 Embedding 配置行。"""
 
@@ -1393,118 +1299,18 @@ class ChatService:
             raise RuntimeError("缺少 Embedding 模型配置记录")
         return config
 
-    def _require_embedding_config(self) -> ModelConfig:
-        """确认会话快照具备可用的 Embedding 配置。"""
-
-        config = self._get_embedding_config()
-        if (
-            not config.base_url
-            or not config.model_name
-            or not config.secret_ref
-            or config.vector_dimension is None
-        ):
-            raise AppError(
-                status_code=503,
-                code="MODEL_NOT_CONFIGURED",
-                message="Embedding 模型尚未配置",
-            )
-        return config
-
-    def _mark_snapshot_index_failure(
+    def _session_to_dto(
         self,
-        snapshots: list[SessionWorldBookEntrySnapshot],
-        message: str,
-    ) -> None:
-        """索引失败时保留已提交会话与快照，并记录脱敏错误。"""
+        chat_session: ChatSession,
+        *,
+        identity: UserIdentity | None = None,
+    ) -> Session:
+        """将会话与其当前身份、角色、世界书绑定转换为公开 DTO。"""
 
-        self.session.expire_all()
-        for snapshot in self._load_entry_snapshots([item.id for item in snapshots]):
-            snapshot.index_status = "failed"
-            snapshot.embedding_version = None
-            snapshot.last_index_error = message
-        self.session.commit()
-
-    def _mark_snapshot_sources_stale(self, snapshot_ids: list[str], message: str) -> None:
-        """配置变化时阻止旧版本快照向量被标记为可用。"""
-
-        for snapshot in self._load_entry_snapshots(snapshot_ids):
-            snapshot.index_status = "stale"
-            snapshot.last_index_error = message
-        self.session.commit()
-
-    def _load_entry_snapshots(
-        self,
-        snapshot_ids: list[str],
-    ) -> list[SessionWorldBookEntrySnapshot]:
-        """按稳定位置读取会话世界书条目快照。"""
-
-        return list(
-            self.session.scalars(
-                select(SessionWorldBookEntrySnapshot)
-                .where(SessionWorldBookEntrySnapshot.id.in_(snapshot_ids))
-                .order_by(
-                    SessionWorldBookEntrySnapshot.position,
-                    SessionWorldBookEntrySnapshot.id,
-                )
-            ).all()
-        )
-
-    def _delete_snapshot_vectors_or_schedule(self, snapshot_ids: list[str]) -> None:
-        """删除会话快照向量；失败时为每个确定 ID 记录补偿任务。"""
-
-        if not snapshot_ids:
-            return
-        try:
-            self.chroma.delete_worldbook(
-                ids=[session_entry_document_id(snapshot_id) for snapshot_id in snapshot_ids]
-            )
-        except Exception:
-            logger.warning(
-                "会话世界书快照向量清理失败，已记录补偿任务",
-                exc_info=True,
-                extra={
-                    "event": "session_snapshot_cleanup_deferred",
-                    "business_ids": {"count": len(snapshot_ids)},
-                },
-            )
-            for snapshot_id in snapshot_ids:
-                self.repository.add(
-                    BackgroundTask(
-                        task_type="vector_cleanup",
-                        status="pending",
-                        scope_id=session_entry_document_id(snapshot_id),
-                        progress_current=0,
-                        progress_total=1,
-                        error_message="会话世界书快照向量待清理",
-                    )
-                )
-            self.session.commit()
-
-    def _session_to_dto(self, chat_session: ChatSession) -> Session:
-        """将会话与其唯一上下文快照转换为公开 DTO。"""
-
-        context_snapshot = self.session.scalar(
-            select(SessionContextSnapshot).where(
-                SessionContextSnapshot.session_id == chat_session.id
-            )
-        )
-        if context_snapshot is None:
-            raise RuntimeError("会话缺少上下文快照")
-        return Session(
-            id=chat_session.id,
-            title=chat_session.title,
-            character_id=chat_session.character_id,
-            world_book_id=chat_session.world_book_id,
-            identity_snapshot_id=context_snapshot.id,
-            identity_name=context_snapshot.identity_name,
-            identity_persona_name=context_snapshot.identity_persona_name,
-            character_name=context_snapshot.character_name,
-            world_book_name=context_snapshot.world_book_name,
-            round_count=chat_session.round_count,
-            consolidated_round=chat_session.consolidated_round,
-            summary=chat_session.summary,
-            created_at=chat_session.created_at,
-            updated_at=chat_session.updated_at,
+        return session_to_dto(
+            self.repository,
+            chat_session,
+            identity or self._get_current_identity(),
         )
 
     def _message_to_dto(self, message: MessageModel) -> Message:
@@ -1534,17 +1340,4 @@ class ChatService:
                 if message.retrieved_entries_json is not None
                 else []
             ),
-        )
-
-    @staticmethod
-    def _calculate_snapshot_hash(entry: WorldBookEntry) -> str:
-        """按统一索引文本规则计算不可变快照哈希。"""
-
-        return calculate_content_hash(
-            build_worldbook_index_text(
-                name=entry.name,
-                category=entry.category,
-                keywords=json.loads(entry.keywords_json),
-                content=entry.content,
-            )
         )

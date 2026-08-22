@@ -113,17 +113,22 @@ class WorldBookService:
         return self._world_book_to_dto(book, self._get_embedding_config().config_version)
 
     def delete_world_book(self, world_book_id: str) -> None:
-        """删除未被引用的世界书，并在提交后清理其全部派生向量。"""
+        """解绑引用会话后删除世界书，并在提交后清理其全部派生向量。"""
 
         book = self._get_world_book_model(world_book_id)
-        referenced_session_id = self.session.scalar(
-            select(ChatSession.id).where(ChatSession.world_book_id == world_book_id).limit(1)
+        # 解绑由 sessions.world_book_id 的 ON DELETE SET NULL 完成，这里只做记录。
+        unbound = self.session.scalar(
+            select(func.count(ChatSession.id)).where(
+                ChatSession.world_book_id == world_book_id
+            )
         )
-        if referenced_session_id is not None:
-            raise AppError(
-                status_code=409,
-                code="RESOURCE_IN_USE",
-                message="世界书已被历史会话引用，不能删除",
+        if unbound:
+            logger.info(
+                "世界书删除前已解绑引用会话",
+                extra={
+                    "event": "world_book_sessions_unbound",
+                    "business_ids": {"worldBookId": world_book_id, "sessionCount": unbound},
+                },
             )
         entry_ids = list(
             self.session.scalars(

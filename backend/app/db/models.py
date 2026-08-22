@@ -132,8 +132,9 @@ class ChatSession(Base):
     character_id: Mapped[str] = mapped_column(
         Text, ForeignKey("characters.id", ondelete="RESTRICT"), nullable=False
     )
+    # 世界书是可空绑定：删除世界书时会话降级为无世界书，而不是拒绝删除。
     world_book_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("world_books.id", ondelete="RESTRICT")
+        Text, ForeignKey("world_books.id", ondelete="SET NULL")
     )
     round_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     consolidated_round: Mapped[int] = mapped_column(
@@ -142,74 +143,6 @@ class ChatSession(Base):
     summary: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     created_at: Mapped[str] = mapped_column(Text, nullable=False, default=utc_now)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False, default=utc_now, onupdate=utc_now)
-
-
-class SessionContextSnapshot(Base):
-    """会话创建时冻结的身份、角色卡和可选世界书上下文。"""
-
-    __tablename__ = "session_context_snapshots"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=new_id)
-    session_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, unique=True
-    )
-    identity_source_id: Mapped[str] = mapped_column(Text, nullable=False)
-    identity_name: Mapped[str] = mapped_column(Text, nullable=False)
-    identity_persona_name: Mapped[str] = mapped_column(Text, nullable=False)
-    identity_bio: Mapped[str] = mapped_column(Text, nullable=False)
-    character_source_id: Mapped[str] = mapped_column(Text, nullable=False)
-    character_name: Mapped[str] = mapped_column(Text, nullable=False)
-    character_introduction: Mapped[str] = mapped_column(Text, nullable=False)
-    character_system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
-    character_dialogue_examples_json: Mapped[str] = mapped_column(Text, nullable=False)
-    world_book_source_id: Mapped[str | None] = mapped_column(Text)
-    world_book_name: Mapped[str | None] = mapped_column(Text)
-    world_book_raw_content: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[str] = mapped_column(Text, nullable=False, default=utc_now)
-
-
-class SessionWorldBookEntrySnapshot(Base):
-    """会话世界书条目的不可变快照。"""
-
-    __tablename__ = "session_world_book_entry_snapshots"
-    __table_args__ = (
-        CheckConstraint("resident IN (0, 1)", name="ck_session_entry_snapshots_resident"),
-        CheckConstraint(
-            "index_status IN ('pending', 'ready', 'stale', 'failed')",
-            name="ck_session_entry_snapshots_index_status",
-        ),
-        Index(
-            "ux_session_entry_snapshot_source",
-            "context_snapshot_id",
-            "source_entry_id",
-            unique=True,
-        ),
-        Index(
-            "ix_session_entry_snapshot_lookup",
-            "context_snapshot_id",
-            "resident",
-            "position",
-        ),
-    )
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=new_id)
-    context_snapshot_id: Mapped[str] = mapped_column(
-        Text,
-        ForeignKey("session_context_snapshots.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    source_entry_id: Mapped[str] = mapped_column(Text, nullable=False)
-    position: Mapped[int] = mapped_column(Integer, nullable=False)
-    name: Mapped[str] = mapped_column(Text, nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    keywords_json: Mapped[str] = mapped_column(Text, nullable=False)
-    category: Mapped[str] = mapped_column(Text, nullable=False)
-    resident: Mapped[int] = mapped_column(Integer, nullable=False)
-    index_status: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding_version: Mapped[int | None] = mapped_column(Integer)
-    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
-    last_index_error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[str] = mapped_column(Text, nullable=False, default=utc_now)
 
 
 class Message(Base):

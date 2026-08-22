@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from json import JSONDecodeError, loads
+from typing import Literal, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -12,6 +13,13 @@ from app.core.exceptions import AppError
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 MAX_ATTEMPTS = 2
 RETRY_DELAY_SECONDS = 0.25
+
+
+class ModelStreamChunk(NamedTuple):
+    """主模型 SSE 的一个增量：正文或推理过程。"""
+
+    kind: Literal["content", "reasoning"]
+    text: str
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -42,14 +50,14 @@ class ModelGateway:
         """发送一条最小流式聊天请求并验证主模型支持 SSE。"""
 
         received_content = False
-        async for content in self.stream_chat_completion(
+        async for chunk in self.stream_chat_completion(
             base_url=base_url,
             model=model,
             api_key=api_key,
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=1,
         ):
-            if content:
+            if chunk.kind == "content" and chunk.text:
                 received_content = True
         if not received_content:
             raise AppError(
@@ -108,22 +116,26 @@ class ModelGateway:
         api_key: str,
         messages: list[dict[str, str]],
         max_tokens: int | None = None,
-    ) -> AsyncIterator[str]:
-        """调用主模型 SSE，并按上游顺序返回正文增量。"""
+        temperature: float | None = None,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        """调用主模型 SSE，并按上游顺序返回推理与正文增量。"""
 
+        # 角色回复默认不固定采样温度：省略该字段由上游取模型默认值，
+        # 避免贪心解码让重说与继续说反复得到同一段文本。
         json_body: dict[str, object] = {
             "model": model,
             "messages": messages,
-            "temperature": 0,
             "stream": True,
         }
         if max_tokens is not None:
             json_body["max_tokens"] = max_tokens
+        if temperature is not None:
+            json_body["temperature"] = temperature
 
         url = f"{normalize_base_url(base_url)}/chat/completions"
         async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
             for attempt in range(MAX_ATTEMPTS):
-                emitted_content = False
+                emitted_any = False
                 try:
                     async with client.stream(
                         "POST",
@@ -182,7 +194,17 @@ class ModelGateway:
                                 if isinstance(first_choice, dict)
                                 else None
                             )
-                            content = delta.get("content") if isinstance(delta, dict) else None
+                            if not isinstance(delta, dict):
+                                continue
+
+                            # 推理增量先于正文到达，转发出去让上层能展示思考状态。
+                            # 两种字段名是同一个东西的不同厂商拼写，取其一即可。
+                            reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                            if isinstance(reasoning, str) and reasoning:
+                                emitted_any = True
+                                yield ModelStreamChunk("reasoning", reasoning)
+
+                            content = delta.get("content")
                             if content is None or content == "":
                                 continue
                             if not isinstance(content, str):
@@ -191,11 +213,11 @@ class ModelGateway:
                                     code="MODEL_OUTPUT_INVALID",
                                     message="模型服务返回格式无效",
                                 )
-                            emitted_content = True
-                            yield content
+                            emitted_any = True
+                            yield ModelStreamChunk("content", content)
                         return
                 except httpx.TimeoutException as exc:
-                    if not emitted_content and attempt + 1 < MAX_ATTEMPTS:
+                    if not emitted_any and attempt + 1 < MAX_ATTEMPTS:
                         await asyncio.sleep(RETRY_DELAY_SECONDS)
                         continue
                     raise AppError(
@@ -204,7 +226,7 @@ class ModelGateway:
                         message="模型服务连接超时",
                     ) from exc
                 except httpx.RequestError as exc:
-                    if not emitted_content and attempt + 1 < MAX_ATTEMPTS:
+                    if not emitted_any and attempt + 1 < MAX_ATTEMPTS:
                         await asyncio.sleep(RETRY_DELAY_SECONDS)
                         continue
                     raise AppError(

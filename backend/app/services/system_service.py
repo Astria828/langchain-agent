@@ -29,8 +29,6 @@ from app.db.models import (
     LongTermMemory,
     MemorySource,
     ModelConfig,
-    SessionContextSnapshot,
-    SessionWorldBookEntrySnapshot,
     UserIdentity,
     WorldBook,
     WorldBookEntry,
@@ -51,10 +49,11 @@ from app.schemas.dto import (
     ModelGroup,
     ModelSettings,
 )
+from app.services.chat_service import session_to_dto
 
 logger = logging.getLogger(__name__)
 
-EXPORT_SCHEMA_VERSION = 1
+EXPORT_SCHEMA_VERSION = 2
 EXPORT_MAX_AGE_SECONDS = 24 * 60 * 60
 FULL_EXPORT_FILE_NAMES = (
     "manifest.json",
@@ -104,32 +103,14 @@ class SystemService:
                 code="RESOURCE_NOT_FOUND",
                 message="会话不存在",
             )
-        context_snapshot = self.session.scalar(
-            select(SessionContextSnapshot).where(
-                SessionContextSnapshot.session_id == chat_session.id
-            )
-        )
-        if context_snapshot is None:
-            raise RuntimeError("会话缺少上下文快照")
-
-        entry_snapshots = list(
-            self.session.scalars(
-                select(SessionWorldBookEntrySnapshot)
-                .where(SessionWorldBookEntrySnapshot.context_snapshot_id == context_snapshot.id)
-                .order_by(
-                    SessionWorldBookEntrySnapshot.position,
-                    SessionWorldBookEntrySnapshot.id,
-                )
-            ).all()
-        )
         payload = {
             "schemaVersion": EXPORT_SCHEMA_VERSION,
             "exportedAt": utc_now(),
-            "session": self._serialize_session(chat_session, context_snapshot),
-            "contextSnapshot": self._serialize_context_snapshot(context_snapshot),
-            "worldBookEntrySnapshots": [
-                self._serialize_entry_snapshot(snapshot) for snapshot in entry_snapshots
-            ],
+            "session": session_to_dto(
+                self.repository,
+                chat_session,
+                self._require_identity(),
+            ).model_dump(by_alias=True),
             "messages": self._serialize_messages(session_id=chat_session.id),
         }
         exported = self._json_bytes(payload)
@@ -551,10 +532,6 @@ class SystemService:
             "worldBooks": len(worldbooks_data),
             "worldBookEntries": sum(len(book["entries"]) for book in worldbooks_data),
             "sessions": len(sessions_data),
-            "contextSnapshots": len(sessions_data),
-            "worldBookEntrySnapshots": sum(
-                len(item["worldBookEntrySnapshots"]) for item in sessions_data
-            ),
             "messages": len(messages_data),
             "messageBlocks": sum(len(message["blocks"]) for message in messages_data),
             "memories": len(memories_data),
@@ -609,49 +586,22 @@ class SystemService:
         ]
 
     def _serialize_sessions(self) -> list[dict[str, object]]:
-        """导出全部会话及其唯一上下文和有序世界书条目快照。"""
+        """导出全部会话及其当前身份、角色卡与世界书绑定。"""
 
         chat_sessions = list(
             self.session.scalars(
                 select(ChatSession).order_by(ChatSession.created_at, ChatSession.id)
             ).all()
         )
-        contexts = list(
-            self.session.scalars(
-                select(SessionContextSnapshot).order_by(
-                    SessionContextSnapshot.session_id,
-                    SessionContextSnapshot.id,
-                )
-            ).all()
+        identity = self.session.scalar(
+            select(UserIdentity).where(UserIdentity.singleton_key == "current")
         )
-        context_by_session = {context.session_id: context for context in contexts}
-        snapshots = self.session.scalars(
-            select(SessionWorldBookEntrySnapshot).order_by(
-                SessionWorldBookEntrySnapshot.context_snapshot_id,
-                SessionWorldBookEntrySnapshot.position,
-                SessionWorldBookEntrySnapshot.id,
-            )
-        ).all()
-        snapshots_by_context: dict[str, list[SessionWorldBookEntrySnapshot]] = defaultdict(list)
-        for snapshot in snapshots:
-            snapshots_by_context[snapshot.context_snapshot_id].append(snapshot)
-
-        result: list[dict[str, object]] = []
-        for chat_session in chat_sessions:
-            context = context_by_session.get(chat_session.id)
-            if context is None:
-                raise RuntimeError("会话缺少上下文快照")
-            result.append(
-                {
-                    "session": self._serialize_session(chat_session, context),
-                    "contextSnapshot": self._serialize_context_snapshot(context),
-                    "worldBookEntrySnapshots": [
-                        self._serialize_entry_snapshot(snapshot)
-                        for snapshot in snapshots_by_context[context.id]
-                    ],
-                }
-            )
-        return result
+        if identity is None:
+            raise RuntimeError("缺少当前用户身份记录")
+        return [
+            session_to_dto(self.repository, chat_session, identity).model_dump(by_alias=True)
+            for chat_session in chat_sessions
+        ]
 
     def _serialize_messages(self, *, session_id: str | None = None) -> list[dict[str, object]]:
         """按会话与位置稳定导出消息，并保持块序号和类型。"""
@@ -800,70 +750,15 @@ class SystemService:
             "updatedAt": entry.updated_at,
         }
 
-    @staticmethod
-    def _serialize_session(
-        chat_session: ChatSession,
-        context: SessionContextSnapshot,
-    ) -> dict[str, object]:
-        """序列化会话本体和用于归档的不可变显示名称。"""
+    def _require_identity(self) -> UserIdentity:
+        """读取单用户当前身份，缺失表示数据库初始化状态损坏。"""
 
-        return {
-            "id": chat_session.id,
-            "title": chat_session.title,
-            "characterId": chat_session.character_id,
-            "worldBookId": chat_session.world_book_id,
-            "identitySnapshotId": context.id,
-            "identityName": context.identity_name,
-            "identityPersonaName": context.identity_persona_name,
-            "characterName": context.character_name,
-            "worldBookName": context.world_book_name,
-            "roundCount": chat_session.round_count,
-            "consolidatedRound": chat_session.consolidated_round,
-            "summary": chat_session.summary,
-            "createdAt": chat_session.created_at,
-            "updatedAt": chat_session.updated_at,
-        }
-
-    @staticmethod
-    def _serialize_context_snapshot(context: SessionContextSnapshot) -> dict[str, object]:
-        """序列化会话创建时冻结的完整身份、角色卡与可选世界书。"""
-
-        return {
-            "id": context.id,
-            "sessionId": context.session_id,
-            "identitySourceId": context.identity_source_id,
-            "identityName": context.identity_name,
-            "identityPersonaName": context.identity_persona_name,
-            "identityBio": context.identity_bio,
-            "characterSourceId": context.character_source_id,
-            "characterName": context.character_name,
-            "characterIntroduction": context.character_introduction,
-            "characterSystemPrompt": context.character_system_prompt,
-            "characterDialogueExamples": json.loads(context.character_dialogue_examples_json),
-            "worldBookSourceId": context.world_book_source_id,
-            "worldBookName": context.world_book_name,
-            "worldBookRawContent": context.world_book_raw_content,
-            "createdAt": context.created_at,
-        }
-
-    @staticmethod
-    def _serialize_entry_snapshot(
-        snapshot: SessionWorldBookEntrySnapshot,
-    ) -> dict[str, object]:
-        """序列化会话世界书条目快照的业务内容与稳定顺序。"""
-
-        return {
-            "id": snapshot.id,
-            "contextSnapshotId": snapshot.context_snapshot_id,
-            "sourceEntryId": snapshot.source_entry_id,
-            "position": snapshot.position,
-            "name": snapshot.name,
-            "content": snapshot.content,
-            "keywords": json.loads(snapshot.keywords_json),
-            "category": snapshot.category,
-            "resident": bool(snapshot.resident),
-            "createdAt": snapshot.created_at,
-        }
+        identity = self.session.scalar(
+            select(UserIdentity).where(UserIdentity.singleton_key == "current")
+        )
+        if identity is None:
+            raise RuntimeError("缺少当前用户身份记录")
+        return identity
 
     @staticmethod
     def _json_bytes(payload: object) -> bytes:
@@ -889,7 +784,6 @@ class SystemService:
 
         stale_values = {"index_status": "stale", "last_index_error": None}
         self.session.execute(update(WorldBookEntry).values(**stale_values))
-        self.session.execute(update(SessionWorldBookEntrySnapshot).values(**stale_values))
         self.session.execute(
             update(LongTermMemory).where(LongTermMemory.status == "active").values(**stale_values)
         )

@@ -21,7 +21,6 @@ from app.db.models import (
     Message,
     MessageBlock,
     ModelConfig,
-    SessionContextSnapshot,
 )
 from app.main import create_app
 from app.repositories.chroma_repository import (
@@ -40,7 +39,7 @@ from app.tasks.memory_task import (
     run_pending_memory_tasks,
 )
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from scripts.init_db import initialize_database
@@ -187,21 +186,6 @@ def add_task_context(
     )
     session.add(chat_session)
     session.flush()
-    session.add(
-        SessionContextSnapshot(
-            session_id=chat_session.id,
-            identity_source_id="identity-current",
-            identity_name="用户",
-            identity_persona_name="旅人",
-            identity_bio="",
-            character_source_id=character.id,
-            character_name=character.name,
-            character_introduction="",
-            character_system_prompt="",
-            character_dialogue_examples_json="[]",
-        )
-    )
-
     position = 0
     add_message(
         session,
@@ -360,8 +344,8 @@ def test_load_target_rounds_rejects_non_contiguous_target(tmp_path: Path) -> Non
         engine.dispose()
 
 
-def test_load_target_rounds_rejects_character_snapshot_mismatch(tmp_path: Path) -> None:
-    """会话当前角色与创建时角色快照不一致时不得整理。"""
+def test_load_target_rounds_rejects_missing_character(tmp_path: Path) -> None:
+    """会话绑定的角色卡已被删除时不得整理。"""
 
     session, engine = create_database(tmp_path)
     try:
@@ -371,24 +355,19 @@ def test_load_target_rounds_rejects_character_snapshot_mismatch(tmp_path: Path) 
             consolidated_round=0,
             target_round=10,
         )
-        other_character = Character(name="诺亚")
-        session.add(other_character)
-        session.flush()
-        snapshot = session.scalar(
-            select(SessionContextSnapshot).where(
-                SessionContextSnapshot.session_id == chat_session.id
-            )
-        )
-        assert snapshot is not None
-        snapshot.character_source_id = other_character.id
+        # sessions.character_id 是 RESTRICT 外键，正常路径删不掉角色卡；
+        # 这里临时关闭外键约束，专门触达服务层的防御分支。
+        session.execute(text("PRAGMA foreign_keys=OFF"))
+        chat_session.character_id = "missing-character"
         session.commit()
+        session.execute(text("PRAGMA foreign_keys=ON"))
         service = MemoryService(session, StubGateway([]), RecordingChroma())
 
         with pytest.raises(AppError) as error:
             service.load_target_rounds(task.id)
 
         assert error.value.code == "MEMORY_TASK_INVALID"
-        assert "角色绑定" in error.value.message
+        assert "角色卡" in error.value.message
     finally:
         session.close()
         engine.dispose()

@@ -905,6 +905,48 @@ button:disabled {
   animation: caretBlink 1s steps(1, end) infinite;
 }
 
+/* 正文尚未产出时的思考状态：模型可能思考数十秒，必须有可见反馈 */
+.thinking-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--text-dim, #8b8b8b);
+}
+
+.thinking-label {
+  flex: none;
+  letter-spacing: 0.08em;
+  opacity: 0.85;
+}
+
+.thinking-label::after {
+  content: '…';
+  animation: thinkingDots 1.2s steps(4, end) infinite;
+}
+
+.thinking-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.6;
+  font-style: italic;
+}
+
+@keyframes thinkingDots {
+  0% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.25;
+  }
+}
+
 /* ── 其他 ─────────────────────────────────────────────── */
 
 .log-row {

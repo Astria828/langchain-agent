@@ -371,7 +371,6 @@ export const mockApi: ApiClient = {
       title: `新对话 · ${character!.name}`,
       characterId: payload.characterId,
       worldBookId: payload.worldBookId,
-      identitySnapshotId: db.identity.id,
       identityName: db.identity.name,
       identityPersonaName: db.identity.personaName,
       characterName: character!.name,

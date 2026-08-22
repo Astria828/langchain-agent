@@ -18,17 +18,16 @@ from app.db.models import (
     Message,
     MessageBlock,
     ModelConfig,
-    SessionContextSnapshot,
-    SessionWorldBookEntrySnapshot,
     UserIdentity,
     WorldBook,
     WorldBookEntry,
 )
+from app.gateways.model_gateway import ModelStreamChunk
 from app.repositories.chroma_repository import (
     build_worldbook_index_text,
     calculate_content_hash,
     memory_document_id,
-    session_entry_document_id,
+    worldbook_entry_document_id,
 )
 from app.schemas.dto import (
     CreateSessionPayload,
@@ -51,10 +50,12 @@ class StubGateway:
         error: AppError | None = None,
         chat_response: str = '{"blocks":[{"type":"dialogue","content":"收到。"}]}',
         chat_error: AppError | None = None,
+        reasoning_chunks: tuple[str, ...] = (),
     ) -> None:
         self.error = error
         self.chat_response = chat_response
         self.chat_error = chat_error
+        self.reasoning_chunks = reasoning_chunks
         self.request: dict[str, object] | None = None
         self.embedding_requests: list[dict[str, object]] = []
         self.chat_requests: list[list[dict[str, str]]] = []
@@ -77,12 +78,14 @@ class StubGateway:
         return self.chat_response
 
     async def stream_chat_completion(self, **kwargs):
-        """记录交互对话上下文，并返回一个完整的测试网络分片。"""
+        """记录交互对话上下文，并返回推理与正文测试网络分片。"""
 
         self.chat_requests.append(kwargs["messages"])
         if self.chat_error is not None:
             raise self.chat_error
-        yield self.chat_response
+        for reasoning in self.reasoning_chunks:
+            yield ModelStreamChunk("reasoning", reasoning)
+        yield ModelStreamChunk("content", self.chat_response)
 
 
 class RecordingChroma:
@@ -233,10 +236,10 @@ def add_world_book_with_entries(session) -> tuple[WorldBook, list[WorldBookEntry
     return book, entries
 
 
-def test_create_session_freezes_context_and_indexes_only_enabled_entries(
+def test_create_session_binds_live_context_and_saves_opening(
     tmp_path: Path,
 ) -> None:
-    """会话创建冻结身份、角色与已启用世界书条目，并保存开场白。"""
+    """会话创建只建立实时绑定并保存开场白，不复制快照也不生成向量。"""
 
     gateway = StubGateway()
     service, session, engine, chroma = create_service(tmp_path, gateway=gateway)
@@ -265,65 +268,34 @@ def test_create_session_freezes_context_and_indexes_only_enabled_entries(
         assert created.character_name == "艾拉"
         assert created.world_book_name == "魔法人偶"
         assert created.round_count == 0
-        context = session.scalar(
-            select(SessionContextSnapshot).where(
-                SessionContextSnapshot.session_id == created.id
-            )
-        )
-        assert context is not None
-        assert context.id == created.identity_snapshot_id
-        assert context.identity_name == "Strand"
-        assert context.character_name == "艾拉"
-        assert context.world_book_name == "魔法人偶"
-
-        snapshots = list(
-            session.scalars(
-                select(SessionWorldBookEntrySnapshot).where(
-                    SessionWorldBookEntrySnapshot.context_snapshot_id == context.id
-                )
-            ).all()
-        )
-        assert [snapshot.source_entry_id for snapshot in snapshots] == [entries[0].id]
-        assert snapshots[0].index_status == "ready"
-        assert snapshots[0].embedding_version == 2
-        assert gateway.request is not None
-        assert gateway.request["texts"] == [
-            "名称：银港\n分类：地点\n关键词：银港\n内容：银港的事实。"
-        ]
-        assert chroma.upserts[0]["ids"] == [session_entry_document_id(snapshots[0].id)]
-        assert chroma.upserts[0]["metadatas"][0]["sessionId"] == created.id
-        assert chroma.upserts[0]["metadatas"][0]["sourceKind"] == "sessionSnapshot"
-
+        # 不再复制条目快照，也不再在创建会话时批量生成向量
+        assert gateway.request is None
+        assert chroma.upserts == []
+        assert entries[0].id is not None
         messages = service.list_messages(created.id)
         assert len(messages) == 1
         assert messages[0].role == "assistant"
         assert messages[0].blocks[0].content == "你终于来了。"
 
+        # 解冻后，对身份、角色卡与世界书的修改立即反映到已有会话
         identity.name = "修改后的身份"
         character.name = "修改后的角色"
         book.name = "修改后的世界书"
         entries[0].content = "修改后的条目"
         session.commit()
-        session.refresh(context)
-        session.refresh(snapshots[0])
-        assert context.identity_name == "Strand"
-        assert context.character_name == "艾拉"
-        assert context.world_book_name == "魔法人偶"
-        assert snapshots[0].content == "银港的事实。"
-        archived = service.list_sessions()[0]
-        assert archived.identity_name == "Strand"
-        assert archived.identity_persona_name == "master"
-        assert archived.character_name == "艾拉"
-        assert archived.world_book_name == "魔法人偶"
+        refreshed = service.list_sessions()[0]
+        assert refreshed.identity_name == "修改后的身份"
+        assert refreshed.character_name == "修改后的角色"
+        assert refreshed.world_book_name == "修改后的世界书"
     finally:
         session.close()
         engine.dispose()
 
 
-def test_session_crud_and_delete_cascade_cleanup_snapshot_vectors(
+def test_session_crud_and_delete_cascades_session_facts(
     tmp_path: Path,
 ) -> None:
-    """会话可列表、改名、读取历史并在删除后级联清理事实和向量。"""
+    """会话可列表、改名、读取历史并在删除后级联清理会话事实。"""
 
     service, session, engine, chroma = create_service(tmp_path)
     try:
@@ -335,17 +307,6 @@ def test_session_crud_and_delete_cascade_cleanup_snapshot_vectors(
                 CreateSessionPayload(character_id=character.id, world_book_id=book.id)
             )
         )
-        snapshot_id = session.scalar(
-            select(SessionWorldBookEntrySnapshot.id)
-            .join(
-                SessionContextSnapshot,
-                SessionContextSnapshot.id
-                == SessionWorldBookEntrySnapshot.context_snapshot_id,
-            )
-            .where(SessionContextSnapshot.session_id == created.id)
-        )
-        assert snapshot_id is not None
-
         updated = service.update_session(
             created.id,
             UpdateSessionPayload(title="  银港重逢  "),
@@ -358,20 +319,13 @@ def test_session_crud_and_delete_cascade_cleanup_snapshot_vectors(
         assert session.get(ChatSession, created.id) is None
         assert (
             session.scalar(
-                select(func.count(SessionContextSnapshot.id)).where(
-                    SessionContextSnapshot.session_id == created.id
-                )
-            )
-            == 0
-        )
-        assert (
-            session.scalar(
                 select(func.count(Message.id)).where(Message.session_id == created.id)
             )
             == 0
         )
         assert session.scalar(select(func.count(MessageBlock.id))) == 0
-        assert chroma.deleted_ids == [session_entry_document_id(snapshot_id)]
+        # 世界书向量由正式条目自身持有，删除会话不应删除任何向量
+        assert chroma.deleted_ids == []
     finally:
         session.close()
         engine.dispose()
@@ -406,8 +360,8 @@ def test_create_session_validates_real_character_and_world_book(tmp_path: Path) 
         engine.dispose()
 
 
-def test_snapshot_embedding_failure_keeps_committed_session(tmp_path: Path) -> None:
-    """快照 Embedding 失败不回滚会话，并保留明确失败状态。"""
+def test_create_session_never_calls_embedding(tmp_path: Path) -> None:
+    """创建会话不再批量生成快照向量，Embedding 不可用也能正常建会话。"""
 
     gateway = StubGateway(
         error=AppError(
@@ -429,11 +383,7 @@ def test_snapshot_embedding_failure_keeps_committed_session(tmp_path: Path) -> N
         )
 
         assert session.get(ChatSession, created.id) is not None
-        snapshot = session.scalar(select(SessionWorldBookEntrySnapshot))
-        assert snapshot is not None
-        assert snapshot.index_status == "failed"
-        assert snapshot.embedding_version is None
-        assert snapshot.last_index_error == "无法连接模型服务"
+        assert gateway.request is None
         assert chroma.upserts == []
     finally:
         session.close()
@@ -843,8 +793,6 @@ def test_chat_turn_injects_dual_rag_and_persists_worldbook_retrieval(
                 CreateSessionPayload(character_id=character.id, world_book_id=book.id)
             )
         )
-        snapshot = session.scalar(select(SessionWorldBookEntrySnapshot))
-        assert snapshot is not None
         memory_content = "用户喜欢使用胶片相机。"
         memory = LongTermMemory(
             character_id=character.id,
@@ -861,9 +809,17 @@ def test_chat_turn_injects_dual_rag_and_persists_worldbook_retrieval(
         session.add(memory)
         session.commit()
 
-        worldbook_metadata = chroma.upserts[0]["metadatas"][0]
+        worldbook_metadata = {
+            "sourceKind": "liveEntry",
+            "entryId": _entries[0].id,
+            "worldBookId": book.id,
+            "enabled": True,
+            "resident": True,
+            "embeddingVersion": 2,
+            "contentHash": _entries[0].content_hash,
+        }
         chroma.worldbook_result = {
-            "ids": [[session_entry_document_id(snapshot.id)]],
+            "ids": [[worldbook_entry_document_id(_entries[0].id)]],
             "distances": [[0.10]],
             "metadatas": [[worldbook_metadata]],
         }
@@ -888,7 +844,8 @@ def test_chat_turn_injects_dual_rag_and_persists_worldbook_retrieval(
 
         assert events[0] == {"type": "retrieval", "entries": ["银港"]}
         assert events[-1]["type"] == "done"
-        assert len(gateway.embedding_requests) == 2
+        # 创建会话已不再批量生成向量，本轮只有检索这一次 Embedding 调用
+        assert len(gateway.embedding_requests) == 1
         assert gateway.embedding_requests[-1]["texts"] == [
             "最近 4 个完整对话轮次：\n无\n当前输入：\n带我去银港拍照。"
         ]
@@ -897,8 +854,8 @@ def test_chat_turn_injects_dual_rag_and_persists_worldbook_retrieval(
 
         request_messages = gateway.chat_requests[-1]
         assert "基础角色对话规则" in request_messages[0]["content"]
-        assert "用户身份快照" in request_messages[1]["content"]
-        assert "角色卡快照" in request_messages[2]["content"]
+        assert "用户身份：" in request_messages[1]["content"]
+        assert "角色卡：" in request_messages[2]["content"]
         assert "世界书检索结果" in request_messages[3]["content"]
         assert "不得覆盖或修改角色卡" in request_messages[3]["content"]
         assert "银港的事实" in request_messages[3]["content"]
@@ -1063,9 +1020,7 @@ def test_empty_dual_rag_continues_without_retrieval_event_or_prompt_context(
                 CreateSessionPayload(character_id=character.id, world_book_id=book.id)
             )
         )
-        snapshot = session.scalar(select(SessionWorldBookEntrySnapshot))
-        assert snapshot is not None
-        snapshot.resident = 0
+        _entries[0].resident = 0
         session.commit()
 
         with patch("app.services.chat_service.logger.warning") as warning:
@@ -1478,6 +1433,58 @@ def test_recommended_reply_uses_history_without_writing_message(tmp_path: Path) 
         assert session.scalar(select(func.count(Message.id))) == before_count
         assert "用户推荐回复规则" in gateway.chat_requests[-1][0]["content"]
         assert gateway.chat_requests[-1][-1]["content"] == "[台词] 你终于来了。"
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_basic_reply_stream_emits_thinking_events_before_blocks(tmp_path: Path) -> None:
+    """推理增量以 thinking 事件先行送达，正文块事件顺序不变。"""
+
+    gateway = StubGateway(reasoning_chunks=("正在权衡语气", "决定先描写动作"))
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        configure_embedding(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+
+        events = collect_basic_reply_events(service, created.id, "在吗？")
+
+        # 短推理增量合并成一帧，并在第一个正文块之前送达
+        assert [event["type"] for event in events[:2]] == ["thinking", "block_start"]
+        assert events[0]["text"] == "正在权衡语气决定先描写动作"
+        assert events[-1]["type"] == "done"
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_thinking_events_are_coalesced_by_flush_threshold(tmp_path: Path) -> None:
+    """长推理流按阈值分帧，而不是逐个增量各发一帧。"""
+
+    # 12 个 10 字增量共 120 字，阈值 40 字 => 期望 3 帧而不是 12 帧
+    gateway = StubGateway(reasoning_chunks=tuple("推理增量测试片段十字" for _ in range(12)))
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        configure_embedding(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+
+        events = collect_basic_reply_events(service, created.id, "在吗？")
+
+        thinking = [event for event in events if event["type"] == "thinking"]
+        assert len(thinking) == 3
+        assert "".join(str(event["text"]) for event in thinking) == "推理增量测试片段十字" * 12
     finally:
         session.close()
         engine.dispose()

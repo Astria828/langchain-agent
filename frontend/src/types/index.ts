@@ -110,8 +110,7 @@ export interface Session {
   title: string;
   characterId: string;
   worldBookId: string | null;
-  identitySnapshotId: string;
-  /** 会话创建时冻结的身份与内容名称，用于历史归档稳定展示 */
+  /** 会话当前绑定的身份与内容名称，随来源实时变化 */
   identityName: string;
   identityPersonaName: string;
   characterName: string;
@@ -218,6 +217,8 @@ export interface LogQuery {
 export type ChatStreamEvent =
   /** 本轮命中的世界书条目 */
   | { type: 'retrieval'; entries: string[] }
+  /** 主模型产出正文前的推理增量，仅用于显示生成状态 */
+  | { type: 'thinking'; text: string }
   | { type: 'block_start'; sequence: number; blockType: BlockType }
   | { type: 'block_delta'; sequence: number; text: string }
   | { type: 'block_end'; sequence: number }

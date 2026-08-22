@@ -20,8 +20,6 @@ from app.db.models import (
     LongTermMemory,
     MemorySource,
     ModelConfig,
-    SessionContextSnapshot,
-    SessionWorldBookEntrySnapshot,
     UserIdentity,
     WorldBook,
     WorldBookEntry,
@@ -120,58 +118,6 @@ def create_export_service(
     session.add_all([*world_book_entries, chat_session])
     session.flush()
 
-    context = SessionContextSnapshot(
-        id="context-1",
-        session_id=chat_session.id,
-        identity_source_id=identity.id,
-        identity_name="历史身份",
-        identity_persona_name="历史身份名称",
-        identity_bio="历史用户设定",
-        character_source_id=character.id,
-        character_name="历史角色",
-        character_introduction="历史简介",
-        character_system_prompt="历史系统提示词",
-        character_dialogue_examples_json=json.dumps(
-            [{"user": "过去好吗", "assistant": "还好"}],
-            ensure_ascii=False,
-        ),
-        world_book_source_id=world_book.id,
-        world_book_name="历史世界书",
-        world_book_raw_content="历史世界书原文",
-    )
-    session.add(context)
-    session.flush()
-
-    entry_snapshots = [
-        SessionWorldBookEntrySnapshot(
-            id="snapshot-2",
-            context_snapshot_id=context.id,
-            source_entry_id="entry-2",
-            position=1,
-            name="历史第二条目",
-            content="历史第二条目正文",
-            keywords_json='["历史二"]',
-            category="地点",
-            resident=0,
-            index_status="ready",
-            embedding_version=1,
-            content_hash="snapshot-hash-2",
-        ),
-        SessionWorldBookEntrySnapshot(
-            id="snapshot-1",
-            context_snapshot_id=context.id,
-            source_entry_id="entry-1",
-            position=0,
-            name="历史第一条目",
-            content="历史第一条目正文",
-            keywords_json='["历史一"]',
-            category="规则",
-            resident=1,
-            index_status="ready",
-            embedding_version=1,
-            content_hash="snapshot-hash-1",
-        ),
-    ]
     messages = [
         MessageModel(
             id="message-2",
@@ -200,7 +146,7 @@ def create_export_service(
         embedding_version=1,
         content_hash="memory-hash-1",
     )
-    session.add_all([*entry_snapshots, *messages, memory])
+    session.add_all([*messages, memory])
     session.flush()
 
     session.add_all(
@@ -268,10 +214,10 @@ def business_state(session: Session) -> dict[str, object]:
     }
 
 
-def test_session_export_uses_immutable_snapshots_and_stable_message_order(
+def test_session_export_uses_live_bindings_and_stable_message_order(
     tmp_path: Path,
 ) -> None:
-    """单会话 JSON 使用历史快照，保留中文、消息位置和块序号且不写业务库。"""
+    """单会话 JSON 使用导出时的实时绑定，保留中文、消息位置和块序号且不写业务库。"""
 
     service, session, engine, settings = create_export_service(tmp_path)
     try:
@@ -286,24 +232,6 @@ def test_session_export_uses_immutable_snapshots_and_stable_message_order(
         )
         session.add(unbound_session)
         session.flush()
-        session.add(
-            SessionContextSnapshot(
-                id="context-unbound",
-                session_id=unbound_session.id,
-                identity_source_id="current",
-                identity_name="历史身份",
-                identity_persona_name="历史身份名称",
-                identity_bio="历史用户设定",
-                character_source_id="character-1",
-                character_name="历史角色",
-                character_introduction="历史简介",
-                character_system_prompt="历史系统提示词",
-                character_dialogue_examples_json="[]",
-                world_book_source_id=None,
-                world_book_name=None,
-                world_book_raw_content=None,
-            )
-        )
         session.commit()
 
         before = business_state(session)
@@ -311,15 +239,12 @@ def test_session_export_uses_immutable_snapshots_and_stable_message_order(
         payload = json.loads(exported.decode("utf-8"))
 
         assert exported.startswith(b"{")
-        assert payload["schemaVersion"] == 1
-        assert payload["session"]["identityName"] == "历史身份"
-        assert payload["session"]["characterName"] == "历史角色"
-        assert payload["session"]["worldBookName"] == "历史世界书"
-        assert payload["contextSnapshot"]["characterSystemPrompt"] == "历史系统提示词"
-        assert [item["position"] for item in payload["worldBookEntrySnapshots"]] == [
-            0,
-            1,
-        ]
+        assert payload["schemaVersion"] == 2
+        assert payload["session"]["identityName"] == "当前身份"
+        assert payload["session"]["characterName"] == "当前角色"
+        assert payload["session"]["worldBookName"] == "当前世界书"
+        assert "contextSnapshot" not in payload
+        assert "worldBookEntrySnapshots" not in payload
         assert [message["position"] for message in payload["messages"]] == [0, 1]
         assert [block["sequence"] for block in payload["messages"][1]["blocks"]] == [
             0,
@@ -334,8 +259,6 @@ def test_session_export_uses_immutable_snapshots_and_stable_message_order(
         )
         assert unbound_payload["session"]["worldBookId"] is None
         assert unbound_payload["session"]["worldBookName"] is None
-        assert unbound_payload["contextSnapshot"]["worldBookRawContent"] is None
-        assert unbound_payload["worldBookEntrySnapshots"] == []
 
         with pytest.raises(AppError) as exc_info:
             service.export_session_json("missing-session")
@@ -392,8 +315,6 @@ def test_full_export_contains_business_files_and_excludes_runtime_secrets(
             "worldBooks": 1,
             "worldBookEntries": 2,
             "sessions": 1,
-            "contextSnapshots": 1,
-            "worldBookEntrySnapshots": 2,
             "messages": 2,
             "messageBlocks": 3,
             "memories": 1,
@@ -407,7 +328,7 @@ def test_full_export_contains_business_files_and_excludes_runtime_secrets(
             entry["position"] for entry in decoded["worldbooks.json"][0]["entries"]
         ] == [0, 1]
         assert (
-            decoded["sessions.json"][0]["contextSnapshot"]["identityName"] == "历史身份"
+            decoded["sessions.json"][0]["identityName"] == "当前身份"
         )
         assert [message["position"] for message in decoded["messages.json"]] == [0, 1]
         assert decoded["memories.json"][0]["sources"] == [
@@ -468,7 +389,7 @@ def test_export_api_downloads_files_and_reclaims_full_export(tmp_path: Path) -> 
                 "loreweave-session-session-1.json"
                 in session_response.headers["content-disposition"]
             )
-            assert session_response.json()["session"]["characterName"] == "历史角色"
+            assert session_response.json()["session"]["characterName"] == "当前角色"
 
             missing_response = client.get("/api/export/sessions/missing-session")
             assert missing_response.status_code == 404
@@ -488,8 +409,8 @@ def test_export_api_downloads_files_and_reclaims_full_export(tmp_path: Path) -> 
             encoding="utf-8"
         )
         for forbidden_business_content in (
-            "历史系统提示词",
-            "历史世界书原文",
+            "当前系统提示词",
+            "当前世界书原文",
             "欢迎回来。",
             "用户与角色完成了第一次会面。",
         ):

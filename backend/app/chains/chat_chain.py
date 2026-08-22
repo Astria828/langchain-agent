@@ -11,7 +11,7 @@ from langchain_core.runnables import Runnable, RunnableLambda
 from pydantic import ValidationError
 
 from app.core.exceptions import AppError
-from app.gateways.model_gateway import ModelGateway
+from app.gateways.model_gateway import ModelGateway, ModelStreamChunk
 from app.schemas.dto import ChatReplyBlock, ChatReplyOutput, RecommendedReplyOutput
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "chat.md"
@@ -28,8 +28,8 @@ async def stream_basic_chat_blocks(
     model: str,
     api_key: str,
     messages: list[dict[str, str]],
-) -> AsyncIterator[ChatReplyBlock]:
-    """流式读取结构化回复，只在单个动作或台词块完整校验后交付。"""
+) -> AsyncIterator[ChatReplyBlock | ModelStreamChunk]:
+    """流式读取结构化回复，转发推理增量，只在块完整校验后交付正文。"""
 
     parser = PydanticOutputParser(pydantic_object=ChatReplyOutput)
     application_prompt = (
@@ -45,7 +45,7 @@ async def stream_basic_chat_blocks(
     in_string = False
     escaped = False
 
-    async for delta in gateway.stream_chat_completion(
+    async for chunk in gateway.stream_chat_completion(
         base_url=base_url,
         model=model,
         api_key=api_key,
@@ -54,8 +54,13 @@ async def stream_basic_chat_blocks(
             *messages,
         ],
     ):
-        raw_parts.append(delta)
-        pending = delta
+        # 推理增量不参与 JSON 结构解析，只用于向上层汇报生成状态。
+        if chunk.kind == "reasoning":
+            yield chunk
+            continue
+
+        raw_parts.append(chunk.text)
+        pending = chunk.text
         if not array_started:
             prefix += pending
             match = BLOCKS_ARRAY_PATTERN.search(prefix)
@@ -146,7 +151,7 @@ def build_recommended_reply_chain(
     model: str,
     api_key: str,
 ) -> Runnable[list[dict[str, str]], RecommendedReplyOutput]:
-    """根据会话快照和最近历史生成一条尚未发送的用户回复。"""
+    """根据当前会话上下文和最近历史生成一条尚未发送的用户回复。"""
 
     parser = PydanticOutputParser(pydantic_object=RecommendedReplyOutput)
     application_prompt = (

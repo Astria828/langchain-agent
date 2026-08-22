@@ -1,6 +1,8 @@
 """物理隔离的世界书与长期记忆 Chroma Collection 基础读写。"""
 
 from hashlib import sha256
+from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import chromadb
@@ -39,16 +41,33 @@ def worldbook_entry_document_id(entry_id: str) -> str:
     return f"worldbook-entry:{entry_id}"
 
 
-def session_entry_document_id(entry_snapshot_id: str) -> str:
-    """生成会话条目快照的确定文档 ID。"""
-
-    return f"session-entry:{entry_snapshot_id}"
-
-
 def memory_document_id(memory_id: str) -> str:
     """生成长期记忆的确定文档 ID。"""
 
     return f"memory:{memory_id}"
+
+
+_client_lock = RLock()
+_clients: dict[str, chromadb.api.ClientAPI] = {}
+
+
+def _shared_client(chroma_dir: Path) -> chromadb.api.ClientAPI:
+    """按数据目录返回进程内共享的 Chroma 客户端。
+
+    chromadb 自己的 SharedSystemClient 注册表不是线程安全的：FastAPI 把同步依赖
+    丢进线程池，请求与后台任务并发构造同一路径的 PersistentClient 时会互相踩到
+    对方的 system 注册/释放，抛出 "Could not connect to tenant default_tenant"。
+    这里统一加锁并复用同一个客户端，同时省掉每次构造的开销。
+    """
+
+    path = str(chroma_dir)
+    with _client_lock:
+        client = _clients.get(path)
+        if client is None:
+            chroma_dir.mkdir(parents=True, exist_ok=True)
+            client = chromadb.PersistentClient(path=path)
+            _clients[path] = client
+        return client
 
 
 class ChromaRepository:
@@ -56,8 +75,7 @@ class ChromaRepository:
 
     def __init__(self, settings: Settings | None = None) -> None:
         resolved_settings = settings or get_settings()
-        resolved_settings.chroma_dir.mkdir(parents=True, exist_ok=True)
-        self.client = chromadb.PersistentClient(path=str(resolved_settings.chroma_dir))
+        self.client = _shared_client(resolved_settings.chroma_dir)
 
     def initialize_collections(self) -> tuple[str, str]:
         """幂等创建两个不使用 Chroma 默认 Embedding 的 Collection。"""
@@ -90,7 +108,7 @@ class ChromaRepository:
         documents: list[str],
         metadatas: list[Metadata],
     ) -> None:
-        """只向世界书 Collection 写入正式条目或会话快照。"""
+        """只向世界书 Collection 写入正式条目。"""
 
         collection = self.client.get_collection(
             name=WORLD_BOOK_COLLECTION,

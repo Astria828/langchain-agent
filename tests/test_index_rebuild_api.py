@@ -18,8 +18,6 @@ from app.db.models import (
     ChatSession,
     LongTermMemory,
     ModelConfig,
-    SessionContextSnapshot,
-    SessionWorldBookEntrySnapshot,
     WorldBook,
     WorldBookEntry,
 )
@@ -31,7 +29,6 @@ from app.repositories.chroma_repository import (
     build_worldbook_index_text,
     calculate_content_hash,
     memory_document_id,
-    session_entry_document_id,
     worldbook_entry_document_id,
 )
 from fastapi.testclient import TestClient
@@ -127,37 +124,6 @@ def seed_rebuild_sources(session_factory: sessionmaker[Session]) -> dict[str, st
         session.add_all([entry, chat_session])
         session.flush()
 
-        context = SessionContextSnapshot(
-            session_id=chat_session.id,
-            identity_source_id="identity-source",
-            identity_name="林舟",
-            identity_persona_name="旅人",
-            identity_bio="",
-            character_source_id=character.id,
-            character_name=character.name,
-            character_introduction="",
-            character_system_prompt="",
-            character_dialogue_examples_json="[]",
-            world_book_source_id=book.id,
-            world_book_name=book.name,
-            world_book_raw_content="原文",
-        )
-        session.add(context)
-        session.flush()
-
-        snapshot = SessionWorldBookEntrySnapshot(
-            context_snapshot_id=context.id,
-            source_entry_id=entry.id,
-            position=0,
-            name="雾港（快照）",
-            content="会话创建时的海雾仍未散去。",
-            keywords_json='["港口"]',
-            category="地点",
-            resident=1,
-            index_status="stale",
-            embedding_version=1,
-            content_hash="old-snapshot-hash",
-        )
         active_memory = LongTermMemory(
             character_id=character.id,
             type="重要剧情",
@@ -180,11 +146,10 @@ def seed_rebuild_sources(session_factory: sessionmaker[Session]) -> dict[str, st
             embedding_version=1,
             content_hash=calculate_content_hash("已取消的旧目标。"),
         )
-        session.add_all([snapshot, active_memory, invalid_memory])
+        session.add_all([active_memory, invalid_memory])
         session.flush()
         return {
             "entry": entry.id,
-            "snapshot": snapshot.id,
             "session": chat_session.id,
             "book": book.id,
             "memory": active_memory.id,
@@ -242,23 +207,21 @@ def test_rebuild_replaces_both_collections_and_marks_sources_ready(
         response = client.post("/api/index/rebuild", json={})
         assert response.status_code == 200
         assert response.json()["data"] == {"rebuildRequired": False}
-        assert sum(len(batch) for batch in gateway.calls) == 3
+        assert sum(len(batch) for batch in gateway.calls) == 2
 
         with session_factory() as session:
             config = session.get(ModelConfig, "embed")
             task = session.scalar(select(BackgroundTask))
             entry = session.get(WorldBookEntry, ids["entry"])
-            snapshot = session.get(SessionWorldBookEntrySnapshot, ids["snapshot"])
             memory = session.get(LongTermMemory, ids["memory"])
             invalid_memory = session.get(LongTermMemory, ids["invalid_memory"])
             assert config is not None and config.rebuild_required == 0
             assert task is not None
             assert (task.status, task.target_version) == ("succeeded", 2)
-            assert (task.progress_current, task.progress_total) == (3, 3)
-            assert entry is not None and snapshot is not None and memory is not None
+            assert (task.progress_current, task.progress_total) == (2, 2)
+            assert entry is not None and memory is not None
             assert {
                 (entry.index_status, entry.embedding_version),
-                (snapshot.index_status, snapshot.embedding_version),
                 (memory.index_status, memory.embedding_version),
             } == {("ready", 2)}
             assert invalid_memory is not None
@@ -286,10 +249,7 @@ def test_rebuild_replaces_both_collections_and_marks_sources_ready(
         )
         world_result = world_collection.get(include=["documents", "metadatas"])
         memory_result = memory_collection.get(include=["documents", "metadatas"])
-        assert set(world_result["ids"]) == {
-            worldbook_entry_document_id(ids["entry"]),
-            session_entry_document_id(ids["snapshot"]),
-        }
+        assert set(world_result["ids"]) == {worldbook_entry_document_id(ids["entry"])}
         assert memory_result["ids"] == [memory_document_id(ids["memory"])]
         assert memory_result["metadatas"][0]["embeddingVersion"] == 2
         assert memory_result["metadatas"][0]["characterId"] == ids["character"]

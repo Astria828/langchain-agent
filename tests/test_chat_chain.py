@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from app.chains.chat_chain import stream_basic_chat_blocks
 from app.core.exceptions import AppError
+from app.gateways.model_gateway import ModelStreamChunk
 
 
 class StubGateway:
@@ -19,7 +20,7 @@ class StubGateway:
 
         self.messages = kwargs["messages"]
         for chunk in self.chunks:
-            yield chunk
+            yield chunk if isinstance(chunk, ModelStreamChunk) else ModelStreamChunk("content", chunk)
 
 
 def collect_blocks(gateway: StubGateway) -> list:
@@ -94,3 +95,36 @@ def test_basic_chat_stream_rejects_unstructured_or_incomplete_output(raw_respons
         collect_blocks(StubGateway([raw_response]))
 
     assert error.value.code == "MODEL_OUTPUT_INVALID"
+
+
+def test_stream_blocks_forwards_thinking_without_breaking_json_parsing() -> None:
+    """推理增量原样转发，正文块解析不受影响。"""
+
+    gateway = StubGateway(
+        [
+            ModelStreamChunk("reasoning", "在想怎么回应"),
+            ModelStreamChunk("content", '{"blocks":[{"type":"action",'),
+            ModelStreamChunk("reasoning", "补一句思考"),
+            ModelStreamChunk("content", '"content":"她抬起头。"}]}'),
+        ]
+    )
+
+    async def collect() -> list:
+        return [
+            item
+            async for item in stream_basic_chat_blocks(
+                gateway=gateway,
+                base_url="https://models.example/v1",
+                model="chat-model",
+                api_key="sk-test",
+                messages=[{"role": "user", "content": "你好"}],
+            )
+        ]
+
+    items = asyncio.run(collect())
+    thinking = [item.text for item in items if isinstance(item, ModelStreamChunk)]
+    blocks = [item for item in items if not isinstance(item, ModelStreamChunk)]
+    assert thinking == ["在想怎么回应", "补一句思考"]
+    assert [(block.type, block.content) for block in blocks] == [
+        ("action", "她抬起头。")
+    ]

@@ -6,17 +6,11 @@ from typing import Any
 
 from app.core.config import Settings
 from app.db.database import create_database_engine, create_session_factory
-from app.db.models import (
-    Character,
-    ChatSession,
-    SessionContextSnapshot,
-    SessionWorldBookEntrySnapshot,
-    WorldBook,
-)
+from app.db.models import Character, ChatSession, WorldBook, WorldBookEntry
 from app.repositories.chroma_repository import (
     build_worldbook_index_text,
     calculate_content_hash,
-    session_entry_document_id,
+    worldbook_entry_document_id,
 )
 from app.retrievers.worldbook_retriever import WorldBookRetriever
 from sqlalchemy.orm import Session as DatabaseSession
@@ -51,13 +45,11 @@ def add_chat_session(
     session: DatabaseSession,
     *,
     bound_world_book: bool,
-) -> tuple[ChatSession, SessionContextSnapshot]:
-    """创建带可选世界书绑定和不可变上下文快照的会话。"""
+) -> tuple[ChatSession, WorldBook | None]:
+    """创建带可选世界书实时绑定的会话。"""
 
     character = Character(name="艾拉")
-    world_book = (
-        WorldBook(name="银港设定", raw_content="原文") if bound_world_book else None
-    )
+    world_book = WorldBook(name="银港设定", raw_content="原文") if bound_world_book else None
     session.add(character)
     if world_book is not None:
         session.add(world_book)
@@ -72,41 +64,23 @@ def add_chat_session(
         summary="",
     )
     session.add(chat_session)
-    session.flush()
-    context = SessionContextSnapshot(
-        session_id=chat_session.id,
-        identity_source_id="identity-current",
-        identity_name="用户",
-        identity_persona_name="旅行者",
-        identity_bio="",
-        character_source_id=character.id,
-        character_name=character.name,
-        character_introduction="",
-        character_system_prompt="",
-        character_dialogue_examples_json="[]",
-        world_book_source_id=world_book.id if world_book is not None else None,
-        world_book_name=world_book.name if world_book is not None else None,
-        world_book_raw_content=world_book.raw_content
-        if world_book is not None
-        else None,
-    )
-    session.add(context)
     session.commit()
-    return chat_session, context
+    return chat_session, world_book
 
 
-def add_snapshot(
+def add_entry(
     session: DatabaseSession,
-    context: SessionContextSnapshot,
+    world_book: WorldBook,
     *,
     position: int,
     name: str,
     keywords: list[str],
     resident: bool = False,
+    enabled: bool = True,
     index_status: str = "ready",
     embedding_version: int | None = 2,
-) -> SessionWorldBookEntrySnapshot:
-    """添加符合存储规范的会话世界书条目快照。"""
+) -> WorldBookEntry:
+    """添加符合存储规范的世界书正式条目。"""
 
     content = f"{name}的设定。"
     index_text = build_worldbook_index_text(
@@ -115,40 +89,40 @@ def add_snapshot(
         keywords=keywords,
         content=content,
     )
-    snapshot = SessionWorldBookEntrySnapshot(
-        context_snapshot_id=context.id,
-        source_entry_id=f"source-{context.id}-{position}",
+    entry = WorldBookEntry(
+        world_book_id=world_book.id,
         position=position,
         name=name,
         content=content,
         keywords_json=json.dumps(keywords, ensure_ascii=False),
         category="地点",
         resident=int(resident),
+        enabled=int(enabled),
         index_status=index_status,
         embedding_version=embedding_version,
         content_hash=calculate_content_hash(index_text),
     )
-    session.add(snapshot)
+    session.add(entry)
     session.commit()
-    return snapshot
+    return entry
 
 
 def vector_metadata(
-    snapshot: SessionWorldBookEntrySnapshot,
+    entry: WorldBookEntry,
     chat_session: ChatSession,
     *,
     content_hash: str | None = None,
 ) -> dict[str, object]:
-    """构造会话快照向量的标准 metadata。"""
+    """构造正式条目向量的标准 metadata。"""
 
     return {
-        "sourceKind": "sessionSnapshot",
-        "entrySnapshotId": snapshot.id,
-        "sessionId": chat_session.id,
+        "sourceKind": "liveEntry",
+        "entryId": entry.id,
         "worldBookId": chat_session.world_book_id,
-        "resident": bool(snapshot.resident),
-        "embeddingVersion": snapshot.embedding_version,
-        "contentHash": content_hash or snapshot.content_hash,
+        "enabled": bool(entry.enabled),
+        "resident": bool(entry.resident),
+        "embeddingVersion": entry.embedding_version,
+        "contentHash": content_hash or entry.content_hash,
     }
 
 
@@ -157,7 +131,7 @@ def test_unbound_session_short_circuits_before_chroma_query(tmp_path: Path) -> N
 
     engine, session = create_database(tmp_path)
     try:
-        chat_session, _context = add_chat_session(session, bound_world_book=False)
+        chat_session, _world_book = add_chat_session(session, bound_world_book=False)
         chroma = RecordingChroma()
 
         result = WorldBookRetriever(session, chroma).retrieve(
@@ -181,32 +155,32 @@ def test_mixed_retrieval_merges_resident_keyword_and_vector_in_order(
 
     engine, session = create_database(tmp_path)
     try:
-        chat_session, context = add_chat_session(session, bound_world_book=True)
-        resident = add_snapshot(
+        chat_session, world_book = add_chat_session(session, bound_world_book=True)
+        resident = add_entry(
             session,
-            context,
+            world_book,
             position=0,
             name="学院规则",
             keywords=["学院"],
             resident=True,
         )
-        keyword = add_snapshot(
+        keyword = add_entry(
             session,
-            context,
+            world_book,
             position=1,
             name="银港",
             keywords=["Silver Port"],
         )
-        vector = add_snapshot(
+        vector = add_entry(
             session,
-            context,
+            world_book,
             position=2,
             name="旧塔",
             keywords=["旧塔"],
         )
-        below_threshold = add_snapshot(
+        below_threshold = add_entry(
             session,
-            context,
+            world_book,
             position=3,
             name="北境",
             keywords=["北境"],
@@ -215,9 +189,9 @@ def test_mixed_retrieval_merges_resident_keyword_and_vector_in_order(
             {
                 "ids": [
                     [
-                        session_entry_document_id(keyword.id),
-                        session_entry_document_id(vector.id),
-                        session_entry_document_id(below_threshold.id),
+                        worldbook_entry_document_id(keyword.id),
+                        worldbook_entry_document_id(vector.id),
+                        worldbook_entry_document_id(below_threshold.id),
                     ]
                 ],
                 "distances": [[0.05, 0.40, 0.400001]],
@@ -238,7 +212,7 @@ def test_mixed_retrieval_merges_resident_keyword_and_vector_in_order(
             embedding_version=2,
         )
 
-        assert [snapshot.id for snapshot in result] == [
+        assert [entry.id for entry in result] == [
             resident.id,
             keyword.id,
             vector.id,
@@ -249,8 +223,8 @@ def test_mixed_retrieval_merges_resident_keyword_and_vector_in_order(
                 "n_results": 3,
                 "where": {
                     "$and": [
-                        {"sourceKind": "sessionSnapshot"},
-                        {"sessionId": chat_session.id},
+                        {"sourceKind": "liveEntry"},
+                        {"worldBookId": chat_session.world_book_id},
                         {"embeddingVersion": 2},
                     ]
                 },
@@ -261,22 +235,22 @@ def test_mixed_retrieval_merges_resident_keyword_and_vector_in_order(
         engine.dispose()
 
 
-def test_vector_results_must_match_current_sqlite_snapshot(tmp_path: Path) -> None:
+def test_vector_results_must_match_current_sqlite_entry(tmp_path: Path) -> None:
     """旧状态、错误哈希和其他会话的残留向量均不能被采用。"""
 
     engine, session = create_database(tmp_path)
     try:
-        chat_session, context = add_chat_session(session, bound_world_book=True)
-        hash_mismatch = add_snapshot(
+        chat_session, world_book = add_chat_session(session, bound_world_book=True)
+        hash_mismatch = add_entry(
             session,
-            context,
+            world_book,
             position=0,
             name="错误哈希",
             keywords=[],
         )
-        stale = add_snapshot(
+        stale = add_entry(
             session,
-            context,
+            world_book,
             position=1,
             name="旧版本",
             keywords=[],
@@ -284,7 +258,7 @@ def test_vector_results_must_match_current_sqlite_snapshot(tmp_path: Path) -> No
             embedding_version=1,
         )
         other_session, other_context = add_chat_session(session, bound_world_book=True)
-        foreign = add_snapshot(
+        foreign = add_entry(
             session,
             other_context,
             position=0,
@@ -295,9 +269,9 @@ def test_vector_results_must_match_current_sqlite_snapshot(tmp_path: Path) -> No
             {
                 "ids": [
                     [
-                        session_entry_document_id(hash_mismatch.id),
-                        session_entry_document_id(stale.id),
-                        session_entry_document_id(foreign.id),
+                        worldbook_entry_document_id(hash_mismatch.id),
+                        worldbook_entry_document_id(stale.id),
+                        worldbook_entry_document_id(foreign.id),
                     ]
                 ],
                 "distances": [[0.10, 0.10, 0.10]],
@@ -333,10 +307,10 @@ def test_missing_query_embedding_keeps_resident_and_keyword_results(
 
     engine, session = create_database(tmp_path)
     try:
-        chat_session, context = add_chat_session(session, bound_world_book=True)
-        resident = add_snapshot(
+        chat_session, world_book = add_chat_session(session, bound_world_book=True)
+        resident = add_entry(
             session,
-            context,
+            world_book,
             position=0,
             name="常驻规则",
             keywords=[],
@@ -344,9 +318,9 @@ def test_missing_query_embedding_keeps_resident_and_keyword_results(
             index_status="failed",
             embedding_version=None,
         )
-        keyword = add_snapshot(
+        keyword = add_entry(
             session,
-            context,
+            world_book,
             position=1,
             name="银港",
             keywords=["银港"],
@@ -362,7 +336,7 @@ def test_missing_query_embedding_keeps_resident_and_keyword_results(
             embedding_version=2,
         )
 
-        assert [snapshot.id for snapshot in result] == [resident.id, keyword.id]
+        assert [entry.id for entry in result] == [resident.id, keyword.id]
         assert chroma.queries == []
     finally:
         session.close()

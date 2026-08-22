@@ -11,14 +11,12 @@ from app.db.models import BackgroundTask, utc_now
 from app.repositories.chroma_repository import (
     ChromaRepository,
     memory_document_id,
-    session_entry_document_id,
     worldbook_entry_document_id,
 )
 
 logger = logging.getLogger(__name__)
 
 WORLD_BOOK_CLEANUP_MESSAGE = "世界书向量待清理"
-SESSION_ENTRY_CLEANUP_MESSAGE = "会话世界书快照向量待清理"
 MEMORY_CLEANUP_MESSAGE = "长期记忆向量待清理"
 VECTOR_CLEANUP_FAILURE_MESSAGE = "向量清理失败"
 
@@ -151,8 +149,6 @@ class VectorCleanupTask:
             raise ValueError("向量清理任务缺少目标 ID")
         if task.error_message == WORLD_BOOK_CLEANUP_MESSAGE:
             return worldbook_entry_document_id(scope_id)
-        if task.error_message == SESSION_ENTRY_CLEANUP_MESSAGE:
-            return session_entry_document_id(scope_id)
         if task.error_message == MEMORY_CLEANUP_MESSAGE:
             return memory_document_id(scope_id)
         raise ValueError("向量清理任务目标类型未知")

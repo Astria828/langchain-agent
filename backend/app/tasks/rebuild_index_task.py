@@ -13,8 +13,6 @@ from app.db.models import (
     BackgroundTask,
     LongTermMemory,
     ModelConfig,
-    SessionContextSnapshot,
-    SessionWorldBookEntrySnapshot,
     WorldBookEntry,
     utc_now,
 )
@@ -26,7 +24,6 @@ from app.repositories.chroma_repository import (
     build_worldbook_index_text,
     calculate_content_hash,
     memory_document_id,
-    session_entry_document_id,
     worldbook_entry_document_id,
 )
 
@@ -72,7 +69,6 @@ def recover_interrupted_index_rebuilds(session: Session) -> int:
         "last_index_error": INDEX_INTERRUPTED_MESSAGE,
     }
     session.execute(update(WorldBookEntry).values(**failed_values))
-    session.execute(update(SessionWorldBookEntrySnapshot).values(**failed_values))
     session.execute(
         update(LongTermMemory).where(LongTermMemory.status == "active").values(**failed_values)
     )
@@ -257,7 +253,7 @@ class RebuildIndexTask:
         return embeddings
 
     def _build_worldbook_bundle(self, target_version: int) -> IndexBundle:
-        """从正式条目和会话快照生成稳定文档与隔离 metadata。"""
+        """从正式条目生成稳定文档与隔离 metadata。"""
 
         ids: list[str] = []
         documents: list[str] = []
@@ -286,37 +282,6 @@ class RebuildIndexTask:
                 }
             )
 
-        snapshot_rows = self.session.execute(
-            select(SessionWorldBookEntrySnapshot, SessionContextSnapshot)
-            .join(
-                SessionContextSnapshot,
-                SessionContextSnapshot.id == SessionWorldBookEntrySnapshot.context_snapshot_id,
-            )
-            .order_by(SessionWorldBookEntrySnapshot.id)
-        ).all()
-        for snapshot, context in snapshot_rows:
-            if context.world_book_source_id is None:
-                raise ValueError("世界书条目快照缺少来源世界书")
-            index_text = build_worldbook_index_text(
-                name=snapshot.name,
-                category=snapshot.category,
-                keywords=self._decode_keywords(snapshot.keywords_json),
-                content=snapshot.content,
-            )
-            content_hash = calculate_content_hash(index_text)
-            ids.append(session_entry_document_id(snapshot.id))
-            documents.append(index_text)
-            metadatas.append(
-                {
-                    "sourceKind": "sessionSnapshot",
-                    "entrySnapshotId": snapshot.id,
-                    "sessionId": context.session_id,
-                    "worldBookId": context.world_book_source_id,
-                    "resident": bool(snapshot.resident),
-                    "embeddingVersion": target_version,
-                    "contentHash": content_hash,
-                }
-            )
         return ids, documents, metadatas
 
     def _build_memory_bundle(self, target_version: int) -> IndexBundle:
@@ -455,20 +420,6 @@ class RebuildIndexTask:
             entry.embedding_version = target_version
             entry.last_index_error = None
 
-        snapshots = self.session.scalars(select(SessionWorldBookEntrySnapshot)).all()
-        for snapshot in snapshots:
-            snapshot.content_hash = calculate_content_hash(
-                build_worldbook_index_text(
-                    name=snapshot.name,
-                    category=snapshot.category,
-                    keywords=self._decode_keywords(snapshot.keywords_json),
-                    content=snapshot.content,
-                )
-            )
-            snapshot.index_status = "ready"
-            snapshot.embedding_version = target_version
-            snapshot.last_index_error = None
-
         memories = self.session.scalars(
             select(LongTermMemory).where(LongTermMemory.status == "active")
         ).all()
@@ -484,7 +435,7 @@ class RebuildIndexTask:
         *,
         error_message: str | None,
     ) -> None:
-        """批量设置正式条目、会话快照和有效记忆的索引状态。"""
+        """批量设置正式条目和有效记忆的索引状态。"""
 
         values = {
             "index_status": status,
@@ -492,7 +443,6 @@ class RebuildIndexTask:
             "last_index_error": error_message,
         }
         self.session.execute(update(WorldBookEntry).values(**values))
-        self.session.execute(update(SessionWorldBookEntrySnapshot).values(**values))
         self.session.execute(
             update(LongTermMemory).where(LongTermMemory.status == "active").values(**values)
         )

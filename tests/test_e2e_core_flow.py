@@ -12,6 +12,7 @@ from app.db.database import (
     create_session_factory,
     get_db_session,
 )
+from app.gateways.model_gateway import ModelStreamChunk
 from app.main import create_app
 from fastapi.testclient import TestClient
 
@@ -54,11 +55,12 @@ class E2EModelGateway:
     async def stream_chat_completion(self, **_kwargs):
         """为交互对话返回两块确定的角色回复。"""
 
-        yield (
+        yield ModelStreamChunk(
+            "content",
             '{"blocks":['
             '{"type":"action","content":"她点亮了控制台。"},'
             '{"type":"dialogue","content":"我们继续。"}'
-            "]}"
+            "]}",
         )
 
 

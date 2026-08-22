@@ -1,4 +1,4 @@
-"""基于会话世界书快照的常驻、关键词与向量混合召回。"""
+"""基于世界书正式条目的常驻、关键词与向量混合召回。"""
 
 import json
 import logging
@@ -6,15 +6,11 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DatabaseSession
 
-from app.db.models import (
-    ChatSession,
-    SessionContextSnapshot,
-    SessionWorldBookEntrySnapshot,
-)
+from app.db.models import ChatSession, WorldBookEntry
 from app.repositories.chroma_repository import (
     ChromaRepository,
     Embedding,
-    session_entry_document_id,
+    worldbook_entry_document_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,7 +20,7 @@ WORLD_BOOK_MAX_COSINE_DISTANCE = 0.40
 
 
 class WorldBookRetriever:
-    """只从当前会话冻结的世界书条目快照中执行混合召回。"""
+    """从会话当前绑定的世界书正式条目中执行混合召回。"""
 
     def __init__(self, session: DatabaseSession, chroma_repository: ChromaRepository) -> None:
         self.session = session
@@ -37,91 +33,84 @@ class WorldBookRetriever:
         current_input: str,
         query_embedding: Embedding | None,
         embedding_version: int,
-    ) -> list[SessionWorldBookEntrySnapshot]:
-        """按常驻、关键词、向量顺序返回去重后的当前会话条目快照。"""
+    ) -> list[WorldBookEntry]:
+        """按常驻、关键词、向量顺序返回去重后的已启用条目。"""
 
         if chat_session.world_book_id is None:
             return []
 
-        snapshots = self._load_session_snapshots(chat_session.id)
-        if not snapshots:
+        entries = self._load_enabled_entries(chat_session.world_book_id)
+        if not entries:
             return []
 
-        resident = [snapshot for snapshot in snapshots if bool(snapshot.resident)]
-        keyword = self._match_keywords(snapshots, current_input)
+        resident = [entry for entry in entries if bool(entry.resident)]
+        keyword = self._match_keywords(entries, current_input)
         vector = self._retrieve_vectors(
             chat_session=chat_session,
-            snapshots=snapshots,
+            entries=entries,
             query_embedding=query_embedding,
             embedding_version=embedding_version,
         )
 
-        merged: list[SessionWorldBookEntrySnapshot] = []
+        merged: list[WorldBookEntry] = []
         seen_ids: set[str] = set()
-        for snapshot in (*resident, *keyword, *vector):
-            if snapshot.id not in seen_ids:
-                seen_ids.add(snapshot.id)
-                merged.append(snapshot)
+        for entry in (*resident, *keyword, *vector):
+            if entry.id not in seen_ids:
+                seen_ids.add(entry.id)
+                merged.append(entry)
         return merged
 
-    def _load_session_snapshots(
-        self,
-        session_id: str,
-    ) -> list[SessionWorldBookEntrySnapshot]:
-        """按冻结位置读取当前会话创建时复制的已启用条目。"""
+    def _load_enabled_entries(self, world_book_id: str) -> list[WorldBookEntry]:
+        """按条目顺序读取世界书当前已启用的正式条目。"""
 
         return list(
             self.session.scalars(
-                select(SessionWorldBookEntrySnapshot)
-                .join(
-                    SessionContextSnapshot,
-                    SessionContextSnapshot.id == SessionWorldBookEntrySnapshot.context_snapshot_id,
+                select(WorldBookEntry)
+                .where(
+                    WorldBookEntry.world_book_id == world_book_id,
+                    WorldBookEntry.enabled == 1,
                 )
-                .where(SessionContextSnapshot.session_id == session_id)
-                .order_by(
-                    SessionWorldBookEntrySnapshot.position,
-                    SessionWorldBookEntrySnapshot.id,
-                )
+                .order_by(WorldBookEntry.position, WorldBookEntry.id)
             ).all()
         )
 
     @staticmethod
     def _match_keywords(
-        snapshots: list[SessionWorldBookEntrySnapshot],
+        entries: list[WorldBookEntry],
         current_input: str,
-    ) -> list[SessionWorldBookEntrySnapshot]:
+    ) -> list[WorldBookEntry]:
         """在当前输入中执行忽略英文大小写的稳定子串匹配。"""
 
         normalized_input = current_input.casefold()
-        matched: list[SessionWorldBookEntrySnapshot] = []
-        for snapshot in snapshots:
-            keywords = json.loads(snapshot.keywords_json)
+        matched: list[WorldBookEntry] = []
+        for entry in entries:
+            keywords = json.loads(entry.keywords_json)
             if any(
                 keyword.strip() and keyword.strip().casefold() in normalized_input
                 for keyword in keywords
             ):
-                matched.append(snapshot)
+                matched.append(entry)
         return matched
 
     def _retrieve_vectors(
         self,
         *,
         chat_session: ChatSession,
-        snapshots: list[SessionWorldBookEntrySnapshot],
+        entries: list[WorldBookEntry],
         query_embedding: Embedding | None,
         embedding_version: int,
-    ) -> list[SessionWorldBookEntrySnapshot]:
-        """查询当前会话向量并用 SQLite 状态与哈希回查结果。"""
+    ) -> list[WorldBookEntry]:
+        """查询正式条目向量并用 SQLite 状态与哈希回查结果。"""
 
         if query_embedding is None:
             return []
 
-        ready_snapshots = {
-            snapshot.id: snapshot
-            for snapshot in snapshots
-            if snapshot.index_status == "ready" and snapshot.embedding_version == embedding_version
+        ready_entries = {
+            entry.id: entry
+            for entry in entries
+            if entry.index_status == "ready" and entry.embedding_version == embedding_version
         }
-        if not ready_snapshots:
+        if not ready_entries:
             return []
 
         result = self.chroma.query_worldbook(
@@ -129,14 +118,14 @@ class WorldBookRetriever:
             n_results=WORLD_BOOK_VECTOR_TOP_K,
             where={
                 "$and": [
-                    {"sourceKind": "sessionSnapshot"},
-                    {"sessionId": chat_session.id},
+                    {"sourceKind": "liveEntry"},
+                    {"worldBookId": chat_session.world_book_id},
                     {"embeddingVersion": embedding_version},
                 ]
             },
         )
 
-        retrieved: list[SessionWorldBookEntrySnapshot] = []
+        retrieved: list[WorldBookEntry] = []
         for document_id, distance, metadata in zip(
             result["ids"][0],
             result["distances"][0],
@@ -145,12 +134,12 @@ class WorldBookRetriever:
         ):
             if distance > WORLD_BOOK_MAX_COSINE_DISTANCE:
                 continue
-            snapshot_id = metadata.get("entrySnapshotId")
-            snapshot = ready_snapshots.get(snapshot_id)
-            if snapshot is None or not self._metadata_matches_snapshot(
+            entry_id = metadata.get("entryId")
+            entry = ready_entries.get(entry_id)
+            if entry is None or not self._metadata_matches_entry(
                 document_id=document_id,
                 metadata=metadata,
-                snapshot=snapshot,
+                entry=entry,
                 chat_session=chat_session,
                 embedding_version=embedding_version,
             ):
@@ -160,25 +149,25 @@ class WorldBookRetriever:
                     document_id,
                 )
                 continue
-            retrieved.append(snapshot)
+            retrieved.append(entry)
         return retrieved
 
     @staticmethod
-    def _metadata_matches_snapshot(
+    def _metadata_matches_entry(
         *,
         document_id: str,
         metadata: dict[str, object],
-        snapshot: SessionWorldBookEntrySnapshot,
+        entry: WorldBookEntry,
         chat_session: ChatSession,
         embedding_version: int,
     ) -> bool:
-        """确认确定 ID、会话边界、版本和内容哈希均与 SQLite 一致。"""
+        """确认确定 ID、世界书边界、启用状态、版本和内容哈希均与 SQLite 一致。"""
 
         return (
-            document_id == session_entry_document_id(snapshot.id)
-            and metadata.get("sourceKind") == "sessionSnapshot"
-            and metadata.get("sessionId") == chat_session.id
+            document_id == worldbook_entry_document_id(entry.id)
+            and metadata.get("sourceKind") == "liveEntry"
             and metadata.get("worldBookId") == chat_session.world_book_id
+            and metadata.get("enabled") is True
             and metadata.get("embeddingVersion") == embedding_version
-            and metadata.get("contentHash") == snapshot.content_hash
+            and metadata.get("contentHash") == entry.content_hash
         )

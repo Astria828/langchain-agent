@@ -260,7 +260,6 @@ class Session(ApiModel):
     title: str
     character_id: str
     world_book_id: str | None
-    identity_snapshot_id: str
     identity_name: str
     identity_persona_name: str
     character_name: str

@@ -1,5 +1,6 @@
 """阶段 1B 的 SQLite 与双 Chroma Repository 测试。"""
 
+import threading
 from pathlib import Path
 
 from app.core.config import Settings
@@ -12,7 +13,7 @@ from app.repositories.chroma_repository import (
     build_worldbook_index_text,
     calculate_content_hash,
     memory_document_id,
-    session_entry_document_id,
+    worldbook_entry_document_id,
 )
 from app.repositories.sqlite_repository import SQLiteRepository
 
@@ -83,7 +84,7 @@ def test_chroma_collections_are_initialized_and_physically_isolated(
     }
     assert collection_names == {WORLD_BOOK_COLLECTION, LONG_TERM_MEMORY_COLLECTION}
 
-    worldbook_id = session_entry_document_id("snapshot-1")
+    worldbook_id = worldbook_entry_document_id("entry-1")
     memory_id = memory_document_id("memory-1")
     repository.upsert_worldbook(
         ids=[worldbook_id],
@@ -91,8 +92,8 @@ def test_chroma_collections_are_initialized_and_physically_isolated(
         documents=["世界书内容"],
         metadatas=[
             {
-                "sourceKind": "sessionSnapshot",
-                "entrySnapshotId": "snapshot-1",
+                "sourceKind": "liveEntry",
+                "entryId": "entry-1",
                 "sessionId": "session-1",
                 "worldBookId": "book-1",
                 "resident": False,
@@ -183,3 +184,31 @@ def test_worldbook_index_text_and_hash_follow_storage_specification() -> None:
     assert calculate_content_hash(index_text) == (
         "90680016f087546b074a63251911fc28df04ec6f2dd9067186085279adbb5f04"
     )
+
+
+def test_chroma_client_is_shared_and_safe_under_concurrent_construction(
+    tmp_path: Path,
+) -> None:
+    """并发构造同一数据目录的仓储复用同一个客户端，且不触发 Chroma 注册表竞态。"""
+
+    # 每个用例的 tmp_path 唯一，因此缓存里必然是本次新建的客户端
+    settings = Settings(environment="test", data_dir=tmp_path)
+    clients: list[object] = []
+    errors: list[str] = []
+
+    def build() -> None:
+        try:
+            clients.append(ChromaRepository(settings).client)
+        except Exception as exc:  # noqa: BLE001 - 竞态下的异常类型不固定
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    # FastAPI 的同步依赖跑在线程池里，请求与后台任务会并发构造同一路径
+    threads = [threading.Thread(target=build) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(clients) == 8
+    assert all(client is clients[0] for client in clients)

@@ -14,13 +14,13 @@ from app.core.exceptions import AppError
 from app.core.security import unprotect_api_key
 from app.db.models import (
     BackgroundTask,
+    Character,
     ChatSession,
     LongTermMemory,
     MemorySource,
     Message,
     MessageBlock,
     ModelConfig,
-    SessionContextSnapshot,
     utc_now,
 )
 from app.gateways.model_gateway import ModelGateway
@@ -398,7 +398,7 @@ class MemoryService:
                 memory.updated_at = utc_now()
 
     def _load_task_context(self, task_id: str) -> tuple[BackgroundTask, ChatSession]:
-        """校验任务、会话、角色快照和目标轮次之间的一致性。"""
+        """校验任务、会话、角色绑定和目标轮次之间的一致性。"""
 
         task = self.repository.get(BackgroundTask, task_id)
         if task is None or task.task_type != "memory_consolidation":
@@ -413,16 +413,8 @@ class MemoryService:
         chat_session = self.repository.get(ChatSession, task.scope_id)
         if chat_session is None:
             raise self._invalid_task_error("长期记忆整理任务对应的会话不存在")
-        context_snapshot = self.session.scalar(
-            select(SessionContextSnapshot).where(
-                SessionContextSnapshot.session_id == chat_session.id
-            )
-        )
-        if (
-            context_snapshot is None
-            or context_snapshot.character_source_id != chat_session.character_id
-        ):
-            raise self._invalid_task_error("会话角色绑定与上下文快照不一致")
+        if self.repository.get(Character, chat_session.character_id) is None:
+            raise self._invalid_task_error("会话绑定的角色卡已被删除")
         if task.target_version > chat_session.round_count:
             raise self._invalid_task_error("长期记忆整理目标轮次超出当前会话轮次")
         if task.target_version != chat_session.consolidated_round + MEMORY_BATCH_SIZE:

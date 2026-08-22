@@ -24,7 +24,10 @@ from app.schemas.dto import (
     UpdateWorldBookEntryPayload,
     UpdateWorldBookPayload,
 )
-from app.services.worldbook_service import WorldBookService, strip_duplicate_keyword_line
+from app.services.worldbook_service import (
+    WorldBookService,
+    strip_duplicate_keyword_line,
+)
 from sqlalchemy import func, select
 
 from scripts.init_db import initialize_database
@@ -191,8 +194,8 @@ def test_world_book_and_entry_crud_preserves_order_and_index_state(
         engine.dispose()
 
 
-def test_world_book_delete_rejects_historical_session_reference(tmp_path: Path) -> None:
-    """历史会话引用存在时返回 409，且世界书仍然保留。"""
+def test_world_book_delete_unbinds_referencing_sessions(tmp_path: Path) -> None:
+    """世界书不再被会话冻结，删除时先把引用会话降级为无世界书。"""
 
     service, session, engine = create_service(tmp_path)
     try:
@@ -205,21 +208,23 @@ def test_world_book_delete_rejects_historical_session_reference(tmp_path: Path) 
         )
         session.add(character)
         session.flush()
-        session.add(
-            ChatSession(
-                title="历史会话",
-                character_id=character.id,
-                world_book_id=book.id,
-            )
+        chat_session = ChatSession(
+            title="历史会话",
+            character_id=character.id,
+            world_book_id=book.id,
         )
+        session.add(chat_session)
         session.commit()
+        session_id = chat_session.id
+
+        service.delete_world_book(book.id)
 
         with pytest.raises(AppError) as error:
-            service.delete_world_book(book.id)
+            service.get_world_book(book.id)
+        assert error.value.status_code == 404
 
-        assert error.value.status_code == 409
-        assert error.value.code == "RESOURCE_IN_USE"
-        assert service.get_world_book(book.id).id == book.id
+        session.expire_all()
+        assert session.get(ChatSession, session_id).world_book_id is None
     finally:
         session.close()
         engine.dispose()

@@ -44,6 +44,7 @@ from app.schemas.dto import (
     SendMessagePayload,
     Session,
     UpdateSessionPayload,
+    parse_extra_body,
 )
 
 logger = logging.getLogger(__name__)
@@ -366,6 +367,7 @@ class ChatService:
             base_url=config.base_url,
             model=config.model_name,
             api_key=api_key,
+            extra_body=self._main_extra_body(config),
         )
         try:
             return await chain.ainvoke(messages)
@@ -646,6 +648,7 @@ class ChatService:
             model=config.model_name,
             api_key=api_key,
             messages=messages,
+            extra_body=self._main_extra_body(config),
         ):
             sequence = len(blocks)
             blocks.append(block)
@@ -681,6 +684,22 @@ class ChatService:
                 message="主模型密钥不可用",
             ) from exc
         return config, api_key
+
+    @staticmethod
+    def _main_extra_body(config: ModelConfig) -> dict[str, object]:
+        """读取主模型的额外请求参数；坏值降级为不追加，不连累整轮对话。"""
+
+        try:
+            return parse_extra_body(config.extra_body_json or "")
+        except ValueError as exc:
+            logger.warning(
+                "主模型额外请求参数无法解析，本次调用按未配置处理",
+                extra={
+                    "event": "model_extra_body_invalid",
+                    "business_ids": {"group": "main", "reason": str(exc)},
+                },
+            )
+            return {}
 
     def _get_session_model(self, session_id: str) -> ChatSession:
         """读取真实会话并转换为稳定的资源不存在错误。"""

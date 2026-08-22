@@ -166,6 +166,8 @@ export interface ModelEndpointConfig {
   model: string;
   keySet: boolean;
   keyTail: string;
+  /** 合并进上游请求体的额外字段原文；仅主模型可填，空串表示不追加 */
+  extraBody: string;
 }
 
 export type ModelSettings = Record<ModelGroup, ModelEndpointConfig>;
@@ -175,6 +177,7 @@ export interface ModelEndpointPayload {
   baseUrl: string;
   model: string;
   apiKey: string;
+  extraBody: string;
 }
 
 export interface ConnectionTestResult {

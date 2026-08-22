@@ -1,5 +1,6 @@
 """与 API 契约和前端 TypeScript 类型对齐的 Pydantic DTO。"""
 
+import json
 from typing import Annotated, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -461,6 +462,31 @@ class LongTermMemory(ApiModel):
 
 ModelGroup = Literal["main", "embed"]
 
+# 应用自己负责组装的请求字段。额外参数只用来补充各家网关的私有参数
+# （provider 路由、transforms 之类），覆盖这些字段会直接破坏内容块协议或
+# 被合并顺序无声丢弃，不如在保存时就明确拒绝。
+RESERVED_EXTRA_BODY_KEYS = frozenset(
+    {"model", "messages", "stream", "response_format", "max_tokens", "temperature"}
+)
+
+
+def parse_extra_body(value: str) -> dict[str, object]:
+    """把额外请求参数原文解析成待合并的字段字典，空串表示不追加。"""
+
+    text = value.strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"额外请求参数不是合法 JSON：{exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("额外请求参数必须是一个 JSON 对象")
+    conflicts = sorted(RESERVED_EXTRA_BODY_KEYS.intersection(parsed))
+    if conflicts:
+        raise ValueError(f"额外请求参数不能覆盖应用自身设置的字段：{'、'.join(conflicts)}")
+    return parsed
+
 
 class ModelEndpointConfig(ApiModel):
     """不包含明文密钥的模型端点配置。"""
@@ -469,6 +495,7 @@ class ModelEndpointConfig(ApiModel):
     model: str
     key_set: bool
     key_tail: str
+    extra_body: str = ""
 
 
 class ModelEndpointPayload(ApiModel):
@@ -477,8 +504,18 @@ class ModelEndpointPayload(ApiModel):
     base_url: str
     model: str
     api_key: str
+    # 只有主模型会用到；Embedding 端点提交非空值一律拒绝。
+    extra_body: str = ""
 
     _validate_required_text = field_validator("base_url", "model")(_non_blank)
+
+    @field_validator("extra_body")
+    @classmethod
+    def validate_extra_body(cls, value: str) -> str:
+        """保存前就确认额外参数可解析，避免坏值到调用时才让对话整体失败。"""
+
+        parse_extra_body(value)
+        return value.strip()
 
 
 class ModelSettings(ApiModel):

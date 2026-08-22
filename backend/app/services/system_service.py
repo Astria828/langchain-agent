@@ -48,6 +48,7 @@ from app.schemas.dto import (
     ModelEndpointPayload,
     ModelGroup,
     ModelSettings,
+    parse_extra_body,
 )
 from app.services.chat_service import session_to_dto
 
@@ -284,12 +285,16 @@ class SystemService:
         config = self._get_config(group)
         base_url = self._validated_base_url(payload.base_url)
         api_key = self._resolve_api_key(config, payload.api_key)
+        extra_body = self._validated_extra_body(group, payload.extra_body)
 
         if group == "main":
+            # 额外参数一并发出去：写错的路由或字段必须在这里就被上游打回，
+            # 而不是等保存之后让每一轮对话都失败。
             await self.gateway.test_main(
                 base_url=base_url,
                 model=payload.model,
                 api_key=api_key,
+                extra_body=parse_extra_body(extra_body),
             )
             tested_dimension = None
             message = "主模型连接测试成功"
@@ -305,6 +310,7 @@ class SystemService:
             base_url=base_url,
             model=payload.model,
             api_key=api_key,
+            extra_body=extra_body,
         )
         config.tested_vector_dimension = tested_dimension
         config.tested_at = utc_now()
@@ -320,6 +326,7 @@ class SystemService:
 
         config = self._get_config(group)
         base_url = self._validated_base_url(payload.base_url)
+        extra_body = self._validated_extra_body(group, payload.extra_body)
         old_api_key = unprotect_api_key(config.secret_ref) if config.secret_ref else None
         api_key = payload.api_key or old_api_key
         if api_key is None:
@@ -329,6 +336,7 @@ class SystemService:
             base_url=base_url,
             model=payload.model,
             api_key=api_key,
+            extra_body=extra_body,
         )
         if config.tested_fingerprint != fingerprint:
             raise AppError(
@@ -348,6 +356,7 @@ class SystemService:
             active_changed = (
                 config.base_url != base_url
                 or config.model_name != payload.model
+                or config.extra_body_json != extra_body
                 or old_api_key != api_key
             )
             if active_changed:
@@ -368,6 +377,7 @@ class SystemService:
 
         config.base_url = base_url
         config.model_name = payload.model
+        config.extra_body_json = extra_body
         if payload.api_key:
             config.secret_ref = protect_api_key(payload.api_key)
             config.key_tail = api_key_tail(payload.api_key)
@@ -805,7 +815,21 @@ class SystemService:
             model=config.model_name,
             key_set=config.secret_ref is not None,
             key_tail=config.key_tail if config.secret_ref is not None else "",
+            extra_body=config.extra_body_json,
         )
+
+    @staticmethod
+    def _validated_extra_body(group: ModelGroup, extra_body: str) -> str:
+        """额外请求参数只对主模型开放，Embedding 端点提交非空值一律拒绝。"""
+
+        cleaned = extra_body.strip()
+        if cleaned and group != "main":
+            raise AppError(
+                status_code=422,
+                code="VALIDATION_FAILED",
+                message="额外请求参数仅对主模型有效",
+            )
+        return cleaned
 
     @staticmethod
     def _validated_base_url(base_url: str) -> str:
@@ -821,15 +845,25 @@ class SystemService:
             ) from exc
 
     @staticmethod
-    def _fingerprint(*, base_url: str, model: str, api_key: str) -> str:
+    def _fingerprint(
+        *,
+        base_url: str,
+        model: str,
+        api_key: str,
+        extra_body: str = "",
+    ) -> str:
         """只保存参数摘要，不在测试状态中保存 API Key。"""
 
+        fields: dict[str, str] = {
+            "baseUrl": base_url,
+            "model": model,
+            "apiKeyHash": sha256(api_key.encode("utf-8")).hexdigest(),
+        }
+        # 没填额外参数时不写进摘要，老配置的指纹保持不变，不会平白要求重测。
+        if extra_body:
+            fields["extraBody"] = extra_body
         payload = json.dumps(
-            {
-                "baseUrl": base_url,
-                "model": model,
-                "apiKeyHash": sha256(api_key.encode("utf-8")).hexdigest(),
-            },
+            fields,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

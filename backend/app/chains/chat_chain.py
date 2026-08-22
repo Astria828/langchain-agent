@@ -185,6 +185,7 @@ async def stream_basic_chat_blocks(
     model: str,
     api_key: str,
     messages: list[dict[str, str]],
+    extra_body: dict[str, object] | None = None,
 ) -> AsyncIterator[ChatReplyBlock]:
     """流式读取结构化回复，只在单个动作或台词块完整校验后交付。"""
 
@@ -214,6 +215,7 @@ async def stream_basic_chat_blocks(
         # 不显式给上限时按上游默认值截断，长回复会在 JSON 中途被切断。
         max_tokens=get_settings().chat_max_tokens,
         response_format=REPLY_RESPONSE_FORMAT,
+        extra_body=extra_body,
     ):
         # 推理增量不是回复正文，直接丢弃，避免污染 JSON 结构解析。
         if chunk.kind == "reasoning":
@@ -331,6 +333,7 @@ def build_recommended_reply_chain(
     base_url: str,
     model: str,
     api_key: str,
+    extra_body: dict[str, object] | None = None,
 ) -> Runnable[list[dict[str, str]], RecommendedReplyOutput]:
     """根据当前会话上下文和最近历史生成一条尚未发送的用户回复。"""
 
@@ -355,6 +358,7 @@ def build_recommended_reply_chain(
                 {"role": "user", "content": application_prompt},
             ],
             response_format=RECOMMENDED_REPLY_RESPONSE_FORMAT,
+            extra_body=extra_body,
         )
         return parser.parse(raw_response)
 

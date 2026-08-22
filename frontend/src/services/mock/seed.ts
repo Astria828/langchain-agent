@@ -430,12 +430,14 @@ export const seedModelSettings: ModelSettings = {
     model: 'claude-sonnet-4-5',
     keySet: true,
     keyTail: '3f8a',
+    extraBody: '',
   },
   embed: {
     baseUrl: 'https://api.openai.com/v1',
     model: 'text-embedding-3-large',
     keySet: true,
     keyTail: '9c2e',
+    extraBody: '',
   },
 };
 

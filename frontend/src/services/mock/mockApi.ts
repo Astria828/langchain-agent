@@ -476,6 +476,7 @@ export const mockApi: ApiClient = {
       model: payload.model,
       keySet: !!newKey || prev.keySet,
       keyTail: newKey ? newKey.slice(-4) : prev.keyTail,
+      extraBody: group === 'main' ? payload.extraBody : '',
     };
     if (embeddingChanged) db.rebuildRequired = true;
     save();

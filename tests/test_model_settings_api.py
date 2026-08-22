@@ -25,12 +25,24 @@ class FakeModelGateway:
     def __init__(self) -> None:
         self.embedding_dimension = 3
         self.main_error: AppError | None = None
-        self.main_calls: list[dict[str, str]] = []
+        self.main_calls: list[dict[str, object]] = []
         self.embedding_calls: list[dict[str, str]] = []
 
-    async def test_main(self, *, base_url: str, model: str, api_key: str) -> None:
+    async def test_main(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str,
+        extra_body: dict[str, object] | None = None,
+    ) -> None:
         self.main_calls.append(
-            {"base_url": base_url, "model": model, "api_key": api_key}
+            {
+                "base_url": base_url,
+                "model": model,
+                "api_key": api_key,
+                "extra_body": extra_body or {},
+            }
         )
         if self.main_error is not None:
             raise self.main_error
@@ -83,8 +95,8 @@ def test_get_model_settings_returns_two_empty_safe_configs(tmp_path: Path) -> No
         assert response.status_code == 200
         payload = response.json()
         assert payload["data"] == {
-            "main": {"baseUrl": "", "model": "", "keySet": False, "keyTail": ""},
-            "embed": {"baseUrl": "", "model": "", "keySet": False, "keyTail": ""},
+            "main": {"baseUrl": "", "model": "", "keySet": False, "keyTail": "", "extraBody": ""},
+            "embed": {"baseUrl": "", "model": "", "keySet": False, "keyTail": "", "extraBody": ""},
         }
         assert "apiKey" not in response.text
         assert payload["requestId"] == response.headers["X-Request-ID"]
@@ -126,6 +138,7 @@ def test_main_configuration_test_save_and_reuse_saved_key(tmp_path: Path) -> Non
             "model": "chat-model",
             "keySet": True,
             "keyTail": "5678",
+            "extraBody": "",
         }
         assert secret not in save_response.text
 
@@ -255,6 +268,78 @@ def test_missing_key_and_invalid_group_return_validation_errors(tmp_path: Path) 
         )
         assert invalid_group.status_code == 422
         assert gateway.main_calls == []
+    finally:
+        client.close()
+        engine.dispose()
+
+
+def test_main_extra_body_is_sent_persisted_and_returned(tmp_path: Path) -> None:
+    """主模型额外请求参数参与连接测试、随配置保存并回显给前端。"""
+
+    gateway = FakeModelGateway()
+    client, engine, _session_factory = create_api_client(tmp_path, gateway)
+    extra = '{"provider":{"order":["Baidu"],"allow_fallbacks":false}}'
+    payload = {**model_payload(), "extraBody": extra}
+    try:
+        assert client.post("/api/settings/models/main/test", json=payload).status_code == 200
+        # 写错的路由必须在连接测试就被上游打回，而不是等每一轮对话都失败
+        assert gateway.main_calls[-1]["extra_body"] == {
+            "provider": {"order": ["Baidu"], "allow_fallbacks": False}
+        }
+
+        save_response = client.put("/api/settings/models/main", json=payload)
+        assert save_response.status_code == 200
+        assert save_response.json()["data"]["main"]["extraBody"] == extra
+        assert client.get("/api/settings/models").json()["data"]["main"]["extraBody"] == extra
+    finally:
+        client.close()
+        engine.dispose()
+
+
+def test_changing_only_extra_body_requires_a_new_connection_test(tmp_path: Path) -> None:
+    """额外参数计入测试指纹：改了就必须重测，不能沿用上一次的结果。"""
+
+    client, engine, _session_factory = create_api_client(tmp_path, FakeModelGateway())
+    payload = model_payload()
+    try:
+        assert client.post("/api/settings/models/main/test", json=payload).status_code == 200
+        assert client.put("/api/settings/models/main", json=payload).status_code == 200
+
+        changed = {**payload, "extraBody": '{"provider":{"order":["Baidu"]}}'}
+        response = client.put("/api/settings/models/main", json=changed)
+        assert response.status_code == 409
+        assert response.json()["code"] == "MODEL_CONFIG_NOT_TESTED"
+    finally:
+        client.close()
+        engine.dispose()
+
+
+def test_malformed_or_reserved_extra_body_is_rejected(tmp_path: Path) -> None:
+    """非法 JSON、非对象与协议字段覆盖都在保存前被拒绝。"""
+
+    client, engine, _session_factory = create_api_client(tmp_path, FakeModelGateway())
+    try:
+        for bad in ('{"provider":', '["Baidu"]', '{"response_format":{"type":"text"}}'):
+            response = client.post(
+                "/api/settings/models/main/test",
+                json={**model_payload(), "extraBody": bad},
+            )
+            assert response.status_code == 422, bad
+    finally:
+        client.close()
+        engine.dispose()
+
+
+def test_embedding_rejects_extra_body(tmp_path: Path) -> None:
+    """额外请求参数只对主模型开放，Embedding 端点提交非空值返回 422。"""
+
+    client, engine, _session_factory = create_api_client(tmp_path, FakeModelGateway())
+    try:
+        response = client.post(
+            "/api/settings/models/embed/test",
+            json={**model_payload(), "extraBody": '{"provider":{"order":["Baidu"]}}'},
+        )
+        assert response.status_code == 422
     finally:
         client.close()
         engine.dispose()

@@ -93,7 +93,14 @@ class ModelGateway:
         self.timeout = httpx.Timeout(timeout_seconds)
         self.transport = transport
 
-    async def test_main(self, *, base_url: str, model: str, api_key: str) -> None:
+    async def test_main(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str,
+        extra_body: dict[str, object] | None = None,
+    ) -> None:
         """发送一条最小流式聊天请求并验证主模型支持 SSE。"""
 
         # 推理模型先把额度花在思维链上：token 给少了就只剩推理增量、正文永远等不到，
@@ -105,6 +112,7 @@ class ModelGateway:
             api_key=api_key,
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=CONNECTION_TEST_MAX_TOKENS,
+            extra_body=extra_body,
         ):
             if chunk.text:
                 received_any = True
@@ -134,10 +142,14 @@ class ModelGateway:
         api_key: str,
         messages: list[dict[str, str]],
         response_format: dict[str, object] | None = None,
+        extra_body: dict[str, object] | None = None,
     ) -> str:
         """调用主模型并返回经过结构校验的文本内容。"""
 
+        # 额外参数先铺底，应用自己组装的字段随后覆盖：保存时已经拒绝过冲突的键，
+        # 这里的顺序只是确保任何遗漏都不会动摇协议字段。
         json_body: dict[str, object] = {
+            **(extra_body or {}),
             "model": model,
             "messages": messages,
             "temperature": 0,
@@ -173,12 +185,15 @@ class ModelGateway:
         max_tokens: int | None = None,
         temperature: float | None = None,
         response_format: dict[str, object] | None = None,
+        extra_body: dict[str, object] | None = None,
     ) -> AsyncIterator[ModelStreamChunk]:
         """调用主模型 SSE，并按上游顺序返回推理与正文增量。"""
 
         # 角色回复默认不固定采样温度：省略该字段由上游取模型默认值，
         # 避免贪心解码让重说与继续说反复得到同一段文本。
+        # 额外参数铺底，应用自己组装的字段随后覆盖。
         json_body: dict[str, object] = {
+            **(extra_body or {}),
             "model": model,
             "messages": messages,
             "stream": True,

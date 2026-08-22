@@ -276,6 +276,9 @@ class ModelConfig(Base):
     group_name: Mapped[str] = mapped_column(Text, primary_key=True)
     base_url: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     model_name: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    # 合并进上游请求体的额外字段原文（JSON 对象或空串），用于 provider 路由这类
+    # 各家网关自有的参数。只对主模型生效，空串表示不追加任何字段。
+    extra_body_json: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     secret_ref: Mapped[str | None] = mapped_column(Text)
     key_tail: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     vector_dimension: Mapped[int | None] = mapped_column(Integer)

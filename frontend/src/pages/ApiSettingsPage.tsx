@@ -21,6 +21,39 @@ interface GroupDef {
   desc: string;
 }
 
+/**
+ * 应用自己组装的请求字段。与后端 RESERVED_EXTRA_BODY_KEYS 保持一致：
+ * 覆盖这些字段会直接破坏内容块协议，在提交前就挡住比等 422 更好懂。
+ */
+const RESERVED_EXTRA_BODY_KEYS = [
+  'model',
+  'messages',
+  'stream',
+  'response_format',
+  'max_tokens',
+  'temperature',
+];
+
+/** 返回额外请求参数的问题描述；无问题返回 null */
+function extraBodyProblem(raw: string): string | null {
+  const text = raw.trim();
+  if (!text) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return '不是合法 JSON，请检查括号、引号与逗号';
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return '必须是一个 JSON 对象，例如 {"provider":{…}}';
+  }
+  const conflicts = RESERVED_EXTRA_BODY_KEYS.filter((key) => key in parsed);
+  if (conflicts.length) {
+    return `不能覆盖应用自身设置的字段：${conflicts.join('、')}`;
+  }
+  return null;
+}
+
 const GROUPS: GroupDef[] = [
   { id: 'main', Icon: PencilIcon, title: '主 API', desc: '对话生成、世界书拆分、记忆提取与整合' },
   {
@@ -38,6 +71,7 @@ interface Draft {
   baseUrl: string;
   model: string;
   apiKey: string;
+  extraBody: string;
 }
 
 type BusyAction = `${ModelGroup}:test` | `${ModelGroup}:save` | 'embed:rebuild';
@@ -60,8 +94,18 @@ export default function ApiSettingsPage() {
   useEffect(() => {
     if (!modelSettings || drafts) return;
     setDrafts({
-      main: { baseUrl: modelSettings.main.baseUrl, model: modelSettings.main.model, apiKey: '' },
-      embed: { baseUrl: modelSettings.embed.baseUrl, model: modelSettings.embed.model, apiKey: '' },
+      main: {
+        baseUrl: modelSettings.main.baseUrl,
+        model: modelSettings.main.model,
+        apiKey: '',
+        extraBody: modelSettings.main.extraBody,
+      },
+      embed: {
+        baseUrl: modelSettings.embed.baseUrl,
+        model: modelSettings.embed.model,
+        apiKey: '',
+        extraBody: '',
+      },
     });
   }, [modelSettings, drafts]);
 
@@ -120,7 +164,12 @@ export default function ApiSettingsPage() {
         prev
           ? {
               ...prev,
-              [group]: { baseUrl: saved.baseUrl, model: saved.model, apiKey: '' },
+              [group]: {
+                baseUrl: saved.baseUrl,
+                model: saved.model,
+                apiKey: '',
+                extraBody: saved.extraBody,
+              },
             }
           : prev,
       );
@@ -218,8 +267,15 @@ function GroupCard({
   onRebuild,
 }: CardProps) {
   const newKey = draft.apiKey.trim();
+  // 额外参数只对主模型开放，Embedding 的草稿恒为空串，不参与比较
+  const supportsExtraBody = def.id === 'main';
+  const extraBodyError = supportsExtraBody ? extraBodyProblem(draft.extraBody) : null;
   const dirty =
-    saved.baseUrl !== draft.baseUrl || saved.model !== draft.model || !!newKey || !saved.keySet;
+    saved.baseUrl !== draft.baseUrl ||
+    saved.model !== draft.model ||
+    (supportsExtraBody && saved.extraBody !== draft.extraBody.trim()) ||
+    !!newKey ||
+    !saved.keySet;
   const status = dirty ? (tested ? '测试通过 · 待保存' : '未验证') : '已生效';
   const green = status !== '未验证';
   const canSave = dirty && tested;
@@ -286,6 +342,41 @@ function GroupCard({
               />
             </div>
           ))}
+
+          {supportsExtraBody && (
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                <span className="label-section">额外请求参数</span>
+                <span style={{ fontSize: 11, color: 'var(--text-dim-2)' }}>可选 · JSON 对象</span>
+              </div>
+              <textarea
+                className="input input--deep input--flat"
+                value={draft.extraBody}
+                onChange={(e) => onField('extraBody', e.target.value)}
+                placeholder={'{"provider":{"order":["Baidu"],"allow_fallbacks":false}}'}
+                rows={4}
+                spellCheck={false}
+                style={{
+                  padding: '12px 16px',
+                  lineHeight: 1.6,
+                  fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+                  fontSize: 12.5,
+                  resize: 'vertical',
+                }}
+              />
+              <div
+                style={{
+                  marginTop: 7,
+                  fontSize: 11.5,
+                  lineHeight: 1.7,
+                  color: extraBodyError ? 'var(--warn)' : 'var(--text-dim-2)',
+                }}
+              >
+                {extraBodyError ??
+                  '原样合并进上游请求体，用于 provider 路由这类各家网关的私有参数。留空表示不追加。'}
+              </div>
+            </div>
+          )}
         </div>
 
         <div
@@ -300,7 +391,7 @@ function GroupCard({
           <button
             className="btn-ghost"
             onClick={onTest}
-            disabled={actionLocked}
+            disabled={actionLocked || !!extraBodyError}
             style={{ fontSize: 12.5, padding: '9px 18px' }}
           >
             {testing ? '正在测试…' : '测试连接'}

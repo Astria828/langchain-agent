@@ -11,7 +11,7 @@ from langchain_core.runnables import Runnable, RunnableLambda
 from pydantic import ValidationError
 
 from app.core.exceptions import AppError
-from app.gateways.model_gateway import ModelGateway, ModelStreamChunk
+from app.gateways.model_gateway import ModelGateway
 from app.schemas.dto import ChatReplyBlock, ChatReplyOutput, RecommendedReplyOutput
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "chat.md"
@@ -36,8 +36,8 @@ async def stream_basic_chat_blocks(
     model: str,
     api_key: str,
     messages: list[dict[str, str]],
-) -> AsyncIterator[ChatReplyBlock | ModelStreamChunk]:
-    """流式读取结构化回复，转发推理增量，只在块完整校验后交付正文。"""
+) -> AsyncIterator[ChatReplyBlock]:
+    """流式读取结构化回复，只在单个动作或台词块完整校验后交付。"""
 
     parser = PydanticOutputParser(pydantic_object=ChatReplyOutput)
     application_prompt = (
@@ -62,9 +62,8 @@ async def stream_basic_chat_blocks(
             *messages,
         ],
     ):
-        # 推理增量不参与 JSON 结构解析，只用于向上层汇报生成状态。
+        # 推理增量不是回复正文，直接丢弃，避免污染 JSON 结构解析。
         if chunk.kind == "reasoning":
-            yield chunk
             continue
 
         raw_parts.append(chunk.text)

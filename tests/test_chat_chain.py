@@ -97,8 +97,8 @@ def test_basic_chat_stream_rejects_unstructured_or_incomplete_output(raw_respons
     assert error.value.code == "MODEL_OUTPUT_INVALID"
 
 
-def test_stream_blocks_forwards_thinking_without_breaking_json_parsing() -> None:
-    """推理增量原样转发，正文块解析不受影响。"""
+def test_stream_blocks_discards_reasoning_without_breaking_json_parsing() -> None:
+    """推理增量被丢弃，穿插在正文分片之间也不影响内容块解析。"""
 
     gateway = StubGateway(
         [
@@ -109,22 +109,8 @@ def test_stream_blocks_forwards_thinking_without_breaking_json_parsing() -> None
         ]
     )
 
-    async def collect() -> list:
-        return [
-            item
-            async for item in stream_basic_chat_blocks(
-                gateway=gateway,
-                base_url="https://models.example/v1",
-                model="chat-model",
-                api_key="sk-test",
-                messages=[{"role": "user", "content": "你好"}],
-            )
-        ]
+    blocks = collect_blocks(gateway)
 
-    items = asyncio.run(collect())
-    thinking = [item.text for item in items if isinstance(item, ModelStreamChunk)]
-    blocks = [item for item in items if not isinstance(item, ModelStreamChunk)]
-    assert thinking == ["在想怎么回应", "补一句思考"]
     assert [(block.type, block.content) for block in blocks] == [
         ("action", "她抬起头。")
     ]

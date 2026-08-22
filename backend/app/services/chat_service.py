@@ -29,7 +29,7 @@ from app.db.models import (
 )
 from app.db.models import Message as MessageModel
 from app.db.models import MessageBlock as MessageBlockModel
-from app.gateways.model_gateway import ModelGateway, ModelStreamChunk
+from app.gateways.model_gateway import ModelGateway
 from app.repositories.chroma_repository import ChromaRepository, calculate_content_hash
 from app.repositories.sqlite_repository import SQLiteRepository
 from app.retrievers.memory_retriever import MemoryRetriever
@@ -50,8 +50,6 @@ logger = logging.getLogger(__name__)
 RETRIEVAL_HISTORY_ROUNDS = 4
 # 角色卡被删时会话仍应可读；绑定被 RESTRICT 外键保护，正常路径到不了这里。
 DELETED_CHARACTER_NAME = "已删除角色卡"
-# 推理增量攒到这个长度才发一帧 SSE，避免前端逐 token 重渲染。
-THINKING_FLUSH_CHARS = 40
 # 重说与继续说的检索文本和上一次逐字相同，缓存住就不必重算同一个向量。
 # 单条 4096 维向量约 130KB，容量取小值即可覆盖“连点几次重说”的场景。
 RETRIEVAL_EMBEDDING_CACHE_SIZE = 8
@@ -572,46 +570,19 @@ class ChatService:
         api_key: str,
         blocks: list[ChatReplyBlock],
     ) -> AsyncIterator[dict[str, object]]:
-        """把 Chain 产出的推理与内容块统一转成 SSE 事件，并把新块追加到 blocks。"""
+        """把 Chain 产出的内容块转成 SSE 事件，并把新块追加到 blocks。"""
 
-        # 推理模型一轮可产生数千个增量，逐个成帧会让前端每帧重渲染一次；
-        # 攒够一小段再发，界面观感不变但帧数降一到两个数量级。
-        thinking = ""
-
-        def flush() -> dict[str, object] | None:
-            nonlocal thinking
-            if not thinking:
-                return None
-            event = {"type": "thinking", "text": thinking}
-            thinking = ""
-            return event
-
-        async for item in stream_basic_chat_blocks(
+        async for block in stream_basic_chat_blocks(
             gateway=self.gateway,
             base_url=config.base_url,
             model=config.model_name,
             api_key=api_key,
             messages=messages,
         ):
-            if isinstance(item, ModelStreamChunk):
-                thinking += item.text
-                if len(thinking) >= THINKING_FLUSH_CHARS:
-                    pending = flush()
-                    if pending is not None:
-                        yield pending
-                continue
-            # 正文块到达前先把剩余推理吐干净，保证前端顺序正确
-            pending = flush()
-            if pending is not None:
-                yield pending
             sequence = len(blocks)
-            blocks.append(item)
-            for event in self._block_stream_events(item, sequence):
+            blocks.append(block)
+            for event in self._block_stream_events(block, sequence):
                 yield event
-
-        pending = flush()
-        if pending is not None:
-            yield pending
 
     def _get_current_identity(self) -> UserIdentity:
         """读取单用户当前身份，缺失表示数据库初始化状态损坏。"""

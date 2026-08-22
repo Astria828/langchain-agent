@@ -92,8 +92,6 @@ interface AppState {
   /** 流式生成中的助手消息，未落库 */
   streaming: Message | null;
   streamRetrieved: string[];
-  /** 主模型正文产出前的推理增量，仅用于显示生成状态 */
-  streamThinking: string;
   messageActionPending: { messageId: string; action: MessageAction } | null;
   loadSessions: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
@@ -146,17 +144,10 @@ const errText = (err: unknown) => (err instanceof Error ? err.message : '操作�
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** 流式生成的空闲态；三个字段始终一起清空，避免新增一个就漏改一处。 */
-const streamIdle = (): Pick<
-  AppState,
-  'streaming' | 'streamRetrieved' | 'streamThinking'
-> => ({
+const streamIdle = (): Pick<AppState, 'streaming' | 'streamRetrieved'> => ({
   streaming: null,
   streamRetrieved: [],
-  streamThinking: '',
 });
-
-/** 只保留渲染用得到的尾部，推理增量可达数万字。 */
-const THINKING_TAIL_CHARS = 200;
 
 export const useAppStore = create<AppState>((set, get) => ({
   bootstrapped: false,
@@ -559,7 +550,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     const baseSequence = action === 'continue' ? originalMessage.blocks.length : 0;
     set((s) => ({
       messageActionPending: { messageId: assistantMessageId, action },
-      streamThinking: '',
       messages: s.messages.map((message) =>
         message.id === assistantMessageId
           ? { ...message, blocks: action === 'continue' ? message.blocks : [], retrieved: action === 'continue' ? message.retrieved : [] }
@@ -570,12 +560,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       await streamMessageAction(currentSessionId, assistantMessageId, action, (event) => {
         if (event.type === 'error') {
           get().flash(event.message);
-          return;
-        }
-        if (event.type === 'thinking') {
-          set((s) => ({
-            streamThinking: (s.streamThinking + event.text).slice(-THINKING_TAIL_CHARS),
-          }));
           return;
         }
         if (event.type === 'retrieval') {
@@ -651,7 +635,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().flash(errText(err));
     } finally {
       if (get().currentSessionId === currentSessionId) {
-        set({ messageActionPending: null, streamThinking: '' });
+        set({ messageActionPending: null });
       }
     }
   },
@@ -709,11 +693,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       switch (event.type) {
         case 'retrieval':
           set({ streamRetrieved: event.entries });
-          break;
-        case 'thinking':
-          set((s) => ({
-            streamThinking: (s.streamThinking + event.text).slice(-THINKING_TAIL_CHARS),
-          }));
           break;
         case 'block_start':
           set((s) =>

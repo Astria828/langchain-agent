@@ -48,7 +48,6 @@ export default function ChatPage() {
   const sessionsError = useAppStore((s) => s.sessionsError);
   const loadSessions = useAppStore((s) => s.loadSessions);
   const streaming = useAppStore((s) => s.streaming);
-  const streamThinking = useAppStore((s) => s.streamThinking);
   const streamRetrieved = useAppStore((s) => s.streamRetrieved);
   const messageActionPending = useAppStore((s) => s.messageActionPending);
   const chatStyle = useAppStore((s) => s.chatStyle);
@@ -237,9 +236,6 @@ export default function ChatPage() {
                   chatStyle={chatStyle}
                   showRagHints={showRagHints}
                   streaming={messageActionPending?.messageId === message.id}
-                  thinking={
-                    messageActionPending?.messageId === message.id ? streamThinking : ''
-                  }
                   actions={
                     message.id === actionableMessageId
                       ? {
@@ -274,7 +270,6 @@ export default function ChatPage() {
                   showRagHints={showRagHints}
                   retrievedOverride={streamRetrieved}
                   streaming
-                  thinking={streamThinking}
                 />
               )}
             </div>
@@ -372,8 +367,6 @@ interface RowProps {
   showRagHints: boolean;
   retrievedOverride?: string[];
   streaming?: boolean;
-  /** 正文尚未产出时展示的推理增量 */
-  thinking?: string;
   actions?: {
     pendingAction: 'regenerate' | 'continue' | null;
     confirmDelete: boolean;
@@ -394,7 +387,6 @@ function MessageRow({
   showRagHints,
   retrievedOverride,
   streaming = false,
-  thinking = '',
   actions,
 }: RowProps) {
   const bubble = chatStyle === '经典气泡';
@@ -468,7 +460,6 @@ function MessageRow({
           {streaming && message.blocks.length === 0 && (
             <div className="thinking-row">
               <span className="thinking-label">思考中</span>
-              {thinking && <span className="thinking-text">{thinking.slice(-120)}</span>}
             </div>
           )}
           <MessageBlocks blocks={message.blocks} chatStyle={chatStyle} streaming={streaming} />

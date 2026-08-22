@@ -1425,8 +1425,8 @@ def test_recommended_reply_uses_history_without_writing_message(tmp_path: Path) 
         engine.dispose()
 
 
-def test_basic_reply_stream_emits_thinking_events_before_blocks(tmp_path: Path) -> None:
-    """推理增量以 thinking 事件先行送达，正文块事件顺序不变。"""
+def test_reasoning_chunks_never_reach_the_client(tmp_path: Path) -> None:
+    """推理增量只在后端被丢弃，不产生任何面向用户的事件。"""
 
     gateway = StubGateway(reasoning_chunks=("正在权衡语气", "决定先描写动作"))
     service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
@@ -1442,36 +1442,13 @@ def test_basic_reply_stream_emits_thinking_events_before_blocks(tmp_path: Path) 
 
         events = collect_basic_reply_events(service, created.id, "在吗？")
 
-        # 短推理增量合并成一帧，并在第一个正文块之前送达
-        assert [event["type"] for event in events[:2]] == ["thinking", "block_start"]
-        assert events[0]["text"] == "正在权衡语气决定先描写动作"
-        assert events[-1]["type"] == "done"
-    finally:
-        session.close()
-        engine.dispose()
-
-
-def test_thinking_events_are_coalesced_by_flush_threshold(tmp_path: Path) -> None:
-    """长推理流按阈值分帧，而不是逐个增量各发一帧。"""
-
-    # 12 个 10 字增量共 120 字，阈值 40 字 => 期望 3 帧而不是 12 帧
-    gateway = StubGateway(reasoning_chunks=tuple("推理增量测试片段十字" for _ in range(12)))
-    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
-    try:
-        configure_main_model(session)
-        configure_embedding(session)
-        character = add_character(session)
-        created = asyncio.run(
-            service.create_session(
-                CreateSessionPayload(character_id=character.id, world_book_id=None)
-            )
-        )
-
-        events = collect_basic_reply_events(service, created.id, "在吗？")
-
-        thinking = [event for event in events if event["type"] == "thinking"]
-        assert len(thinking) == 3
-        assert "".join(str(event["text"]) for event in thinking) == "推理增量测试片段十字" * 12
+        assert [event["type"] for event in events] == [
+            "block_start",
+            "block_delta",
+            "block_end",
+            "done",
+        ]
+        assert not any("正在权衡语气" in str(event) for event in events)
     finally:
         session.close()
         engine.dispose()

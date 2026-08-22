@@ -217,8 +217,6 @@ export interface LogQuery {
 export type ChatStreamEvent =
   /** 本轮命中的世界书条目 */
   | { type: 'retrieval'; entries: string[] }
-  /** 主模型产出正文前的推理增量，仅用于显示生成状态 */
-  | { type: 'thinking'; text: string }
   | { type: 'block_start'; sequence: number; blockType: BlockType }
   | { type: 'block_delta'; sequence: number; text: string }
   | { type: 'block_end'; sequence: number }

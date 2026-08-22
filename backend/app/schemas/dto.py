@@ -339,6 +339,9 @@ class Message(ApiModel):
     blocks: list[MessageBlock]
     created_at: str
     retrieved: list[str] = Field(default_factory=list)
+    # 已发出但没能配对回复的断层用户消息：不计入轮次，也不参与长期记忆整理，
+    # 可以被单独删除。助手消息（含开场白）与完整轮次里的消息恒为 False。
+    unanswered: bool = False
 
 
 class RecommendedReplyOutput(ApiModel):

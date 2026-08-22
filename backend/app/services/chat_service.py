@@ -82,6 +82,16 @@ CONTINUE_REPLY_INSTRUCTION = (
 )
 
 
+def _is_unanswered(message: MessageModel) -> bool:
+    """判断消息是否为已发出却没能配对回复的断层消息。
+
+    只有用户消息会出现这种状态：助手回复要么带轮次编号完整落库，要么根本不落库。
+    开场白是没有轮次编号的助手消息，属于会话正常内容，不算断层。
+    """
+
+    return message.role == "user" and message.turn_number is None
+
+
 def session_to_dto(
     repository: SQLiteRepository,
     chat_session: ChatSession,
@@ -246,6 +256,32 @@ class ChatService:
         chat_session.updated_at = utc_now()
         self.repository.delete(assistant_message)
         self.repository.delete(user_message)
+        self.session.commit()
+
+    def delete_unanswered_message(self, session_id: str, message_id: str) -> None:
+        """物理删除一条没能等到回复的用户消息。
+
+        不限定在物理末尾：生成失败后用户往往会继续对话，断层消息因此会留在历史中间，
+        只允许删末尾等于让这些消息永远删不掉。断层消息没有轮次编号，
+        既不计入 round_count，也不进入长期记忆整理，删除不影响任何累计状态。
+        """
+
+        chat_session = self._get_session_model(session_id)
+        message = self.repository.get(MessageModel, message_id)
+        if message is None or message.session_id != session_id:
+            raise AppError(
+                status_code=404,
+                code="RESOURCE_NOT_FOUND",
+                message="消息不存在",
+            )
+        if not _is_unanswered(message):
+            raise AppError(
+                status_code=409,
+                code="MESSAGE_NOT_DELETABLE",
+                message="只能单独删除没有收到回复的用户消息",
+            )
+        chat_session.updated_at = utc_now()
+        self.repository.delete(message)
         self.session.commit()
 
     def begin_message_action(
@@ -1383,6 +1419,7 @@ class ChatService:
                 for block in blocks
             ],
             created_at=message.created_at,
+            unanswered=_is_unanswered(message),
             retrieved=(
                 json.loads(message.retrieved_entries_json)
                 if message.retrieved_entries_json is not None

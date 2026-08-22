@@ -1521,3 +1521,154 @@ def test_regenerate_reuses_the_retrieval_embedding(tmp_path: Path) -> None:
     finally:
         session.close()
         engine.dispose()
+
+
+def test_failed_reply_leaves_a_deletable_unanswered_message(tmp_path: Path) -> None:
+    """生成失败后用户原文仍在库中，标记为断层消息并可被单独删除。"""
+
+    gateway = StubGateway(
+        chat_error=AppError(
+            status_code=502,
+            code="MODEL_OUTPUT_INVALID",
+            message="主模型返回的内容块结构无效",
+        )
+    )
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+
+        events = collect_basic_reply_events(service, created.id, "在吗？")
+        assert events[-1]["type"] == "error"
+
+        messages = service.list_messages(created.id)
+        dangling = messages[-1]
+        assert dangling.role == "user"
+        assert dangling.unanswered is True
+        assert dangling.blocks[0].content == "在吗？"
+        assert service.list_sessions()[0].round_count == 0
+        # 开场白同样没有轮次编号，但它是会话正常内容，不能被当成断层消息
+        assert messages[0].role == "assistant"
+        assert messages[0].unanswered is False
+
+        service.delete_unanswered_message(created.id, dangling.id)
+
+        remaining = service.list_messages(created.id)
+        assert [message.role for message in remaining] == ["assistant"]
+        assert service.list_sessions()[0].round_count == 0
+        assert session.scalar(
+            select(func.count(Message.id)).where(Message.id == dangling.id)
+        ) == 0
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_unanswered_message_stranded_in_history_can_still_be_deleted(tmp_path: Path) -> None:
+    """生成失败后继续对话，留在历史中间的断层消息仍然可删且不影响已有轮次。"""
+
+    gateway = StubGateway(
+        chat_error=AppError(
+            status_code=502,
+            code="MODEL_CONNECTION_FAILED",
+            message="无法连接模型服务",
+        )
+    )
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+
+        collect_basic_reply_events(service, created.id, "这句没能等到回复")
+        stranded = service.list_messages(created.id)[-1]
+        assert stranded.unanswered is True
+
+        # 模型恢复后用户继续对话，断层消息就被压在了历史中间
+        gateway.chat_error = None
+        collect_basic_reply_events(service, created.id, "换个话题")
+        assert service.list_sessions()[0].round_count == 1
+        assert service.list_messages(created.id)[-3].id == stranded.id
+
+        service.delete_unanswered_message(created.id, stranded.id)
+
+        remaining = service.list_messages(created.id)
+        assert [message.role for message in remaining] == ["assistant", "user", "assistant"]
+        assert all(not message.unanswered for message in remaining)
+        assert service.list_sessions()[0].round_count == 1
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_message_inside_a_complete_turn_cannot_be_deleted_alone(tmp_path: Path) -> None:
+    """完整轮次里的消息只能整轮删除，避免留下没有配对的半轮。"""
+
+    service, session, engine, _chroma = create_service(tmp_path)
+    try:
+        configure_main_model(session)
+        character = add_character(session)
+        created = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+        collect_basic_reply_events(service, created.id, "你好")
+        messages = service.list_messages(created.id)
+        opening, user_message, assistant_message = messages
+
+        for target in (opening, user_message, assistant_message):
+            with pytest.raises(AppError) as error:
+                service.delete_unanswered_message(created.id, target.id)
+            assert error.value.status_code == 409
+            assert error.value.code == "MESSAGE_NOT_DELETABLE"
+
+        assert len(service.list_messages(created.id)) == 3
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_deleting_unanswered_message_rejects_unknown_or_foreign_message(tmp_path: Path) -> None:
+    """不存在或属于别的会话的消息按资源不存在处理。"""
+
+    gateway = StubGateway(
+        chat_error=AppError(status_code=502, code="MODEL_OUTPUT_INVALID", message="失败")
+    )
+    service, session, engine, _chroma = create_service(tmp_path, gateway=gateway)
+    try:
+        configure_main_model(session)
+        character = add_character(session)
+        first = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+        second = asyncio.run(
+            service.create_session(
+                CreateSessionPayload(character_id=character.id, world_book_id=None)
+            )
+        )
+        collect_basic_reply_events(service, first.id, "断层内容")
+        dangling = service.list_messages(first.id)[-1]
+
+        with pytest.raises(AppError) as missing:
+            service.delete_unanswered_message(first.id, "not-a-real-message")
+        assert missing.value.status_code == 404
+
+        with pytest.raises(AppError) as foreign:
+            service.delete_unanswered_message(second.id, dangling.id)
+        assert foreign.value.status_code == 404
+        assert foreign.value.code == "RESOURCE_NOT_FOUND"
+    finally:
+        session.close()
+        engine.dispose()

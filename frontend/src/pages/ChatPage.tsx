@@ -55,6 +55,7 @@ export default function ChatPage() {
   const identity = useAppStore((s) => s.identity);
   const renameSession = useAppStore((s) => s.renameSession);
   const removeTurn = useAppStore((s) => s.removeTurn);
+  const removeMessage = useAppStore((s) => s.removeMessage);
   const runMessageAction = useAppStore((s) => s.runMessageAction);
   const recommendReply = useAppStore((s) => s.recommendReply);
   const send = useAppStore((s) => s.send);
@@ -259,6 +260,23 @@ export default function ChatPage() {
                         }
                       : undefined
                   }
+                  danglingActions={
+                    message.unanswered
+                      ? {
+                          confirmDelete: deleteConfirmId === message.id,
+                          disabled: busy,
+                          onDeleteRequest: () => setDeleteConfirmId(message.id),
+                          onDeleteCancel: () => setDeleteConfirmId(null),
+                          onDeleteConfirm: () => {
+                            setDeletingTurn(true);
+                            void removeMessage(message.id).finally(() => {
+                              setDeletingTurn(false);
+                              setDeleteConfirmId(null);
+                            });
+                          },
+                        }
+                      : undefined
+                  }
                 />
               ))}
               {streaming && (
@@ -377,6 +395,14 @@ interface RowProps {
     onDeleteCancel: () => void;
     onDeleteConfirm: () => void;
   };
+  /** 断层用户消息的单独删除入口，仅在 message.unanswered 时提供 */
+  danglingActions?: {
+    confirmDelete: boolean;
+    disabled: boolean;
+    onDeleteRequest: () => void;
+    onDeleteCancel: () => void;
+    onDeleteConfirm: () => void;
+  };
 }
 
 function MessageRow({
@@ -388,6 +414,7 @@ function MessageRow({
   retrievedOverride,
   streaming = false,
   actions,
+  danglingActions,
 }: RowProps) {
   const bubble = chatStyle === '经典气泡';
 
@@ -508,6 +535,37 @@ function MessageRow({
 
   const text = message.blocks.map((b) => b.content).join('');
 
+  // 这条消息发出后没能等到回复。保留原文，另给一个单独删除的出口，
+  // 否则它会永远卡在历史里：整轮删除需要一条配对的角色回复才能触发。
+  const danglingNote = danglingActions && (
+    <div style={{ marginTop: 8, display: 'flex', justifyContent: bubble ? 'flex-end' : undefined }}>
+      {!danglingActions.confirmDelete ? (
+        <div className="act-row">
+          <span className="act-note">这条消息没有收到回复。</span>
+          <button
+            className="act-btn act-btn--danger"
+            onClick={danglingActions.onDeleteRequest}
+            disabled={danglingActions.disabled}
+          >
+            <TrashIcon size={13} strokeWidth={1.5} />
+            删除这条
+          </button>
+        </div>
+      ) : (
+        <div className="act-row">
+          <span className="act-note">删除这条消息？原文将被永久删除。</span>
+          <button className="act-btn act-btn--confirm" onClick={danglingActions.onDeleteConfirm}>
+            确认删除
+          </button>
+          <span className="act-sep" />
+          <button className="act-btn" onClick={danglingActions.onDeleteCancel}>
+            取消
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div style={{ animation: 'fadeUp .35s ease both' }}>
       {bubble ? (
@@ -527,7 +585,8 @@ function MessageRow({
             {text}
           </div>
         </div>
-      ) : (
+      ) : null}
+      {bubble ? null : (
         <div style={{ padding: '2px 0' }}>
           <div
             style={{
@@ -548,6 +607,7 @@ function MessageRow({
           </div>
         </div>
       )}
+      {danglingNote}
     </div>
   );
 }

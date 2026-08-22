@@ -425,6 +425,15 @@ export const mockApi: ApiClient = {
     save();
     return delay(undefined);
   },
+  deleteMessage: (sessionId, messageId) => {
+    const messages = db.messages[sessionId] ?? [];
+    const index = messages.findIndex((message) => message.id === messageId);
+    if (index < 0) notFound('消息');
+    if (!messages[index].unanswered) throw new Error('只能单独删除没有收到回复的用户消息');
+    messages.splice(index, 1);
+    save();
+    return delay(undefined);
+  },
   recommendedReply: () => delay({ content: '我们接下来该怎么做？' }),
 
   /* ── 长期记忆 ─────────────────────────────────────────── */

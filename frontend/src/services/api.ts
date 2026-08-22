@@ -113,6 +113,8 @@ export interface ApiClient {
   deleteSession(id: string): Promise<void>;
   listMessages(sessionId: string): Promise<Message[]>;
   deleteTurn(sessionId: string, assistantMessageId: string): Promise<void>;
+  /** 单独删除一条没能等到回复的断层用户消息 */
+  deleteMessage(sessionId: string, messageId: string): Promise<void>;
   recommendedReply(sessionId: string): Promise<RecommendedReply>;
 
   /* 长期记忆 */
@@ -183,6 +185,8 @@ export const realApi: ApiClient = {
   listMessages: (sessionId) => request(`/sessions/${sessionId}/messages`),
   deleteTurn: (sessionId, assistantMessageId) =>
     request(`/sessions/${sessionId}/turns/${assistantMessageId}`, { method: 'DELETE' }),
+  deleteMessage: (sessionId, messageId) =>
+    request(`/sessions/${sessionId}/messages/${messageId}`, { method: 'DELETE' }),
   recommendedReply: (sessionId) =>
     request(`/sessions/${sessionId}/recommended-reply`, { method: 'POST' }),
 

@@ -99,6 +99,7 @@ interface AppState {
   renameSession: (id: string, title: string) => Promise<boolean>;
   removeSession: (id: string) => Promise<void>;
   removeTurn: (assistantMessageId: string) => Promise<boolean>;
+  removeMessage: (messageId: string) => Promise<boolean>;
   runMessageAction: (assistantMessageId: string, action: MessageAction) => Promise<void>;
   recommendReply: () => Promise<string | null>;
   send: (text: string) => Promise<void>;
@@ -535,6 +536,26 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (get().currentSessionId !== currentSessionId) return true;
       set({ messages, sessions });
       get().flash('已删除最后一轮对话');
+      return true;
+    } catch (err) {
+      get().flash(errText(err));
+      return false;
+    }
+  },
+
+  removeMessage: async (messageId) => {
+    const { currentSessionId, streaming, messageActionPending } = get();
+    if (!currentSessionId || streaming || messageActionPending) return false;
+    try {
+      await client.deleteMessage(currentSessionId, messageId);
+      // 服务端会刷新会话的 updatedAt，列表排序要跟着一起更新
+      const [messages, sessions] = await Promise.all([
+        client.listMessages(currentSessionId),
+        client.listSessions(),
+      ]);
+      if (get().currentSessionId !== currentSessionId) return true;
+      set({ messages, sessions });
+      get().flash('已删除这条未收到回复的消息');
       return true;
     } catch (err) {
       get().flash(errText(err));

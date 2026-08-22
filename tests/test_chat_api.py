@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.api.system import get_chroma_repository, get_model_gateway
 from app.core.config import Settings
+from app.core.exceptions import AppError
 from app.core.security import protect_api_key
 from app.db.database import (
     create_database_engine,
@@ -635,6 +636,78 @@ def test_memory_invalidation_keeps_sqlite_state_when_vector_delete_fails(
             assert len(cleanup_tasks) == 1
             assert cleanup_tasks[0].status == "failed"
             assert content not in (cleanup_tasks[0].error_message or "")
+    finally:
+        client.close()
+        engine.dispose()
+
+
+class FailingReplyGateway(UnusedGateway):
+    """模拟主模型生成失败，使用户消息落库后没有配对回复。"""
+
+    async def stream_chat_completion(self, **_kwargs):
+        """建立流之后再失败，复现用户已看到消息发出的断层场景。"""
+
+        raise AppError(
+            status_code=502,
+            code="MODEL_OUTPUT_INVALID",
+            message="主模型返回的内容块结构无效",
+        )
+        yield  # pragma: no cover - 保持异步生成器签名
+
+
+def test_unanswered_message_api_exposes_and_deletes_dangling_message(tmp_path: Path) -> None:
+    """回复失败留下的用户消息带 unanswered 标记，并可通过消息接口单独删除。"""
+
+    client, engine, session_factory = create_chat_client(tmp_path)
+    try:
+        configure_main_model(session_factory)
+        character = client.post("/api/characters", json={}).json()["data"]
+        character = client.put(
+            f"/api/characters/{character['id']}",
+            json={
+                "name": "艾拉",
+                "dialogueExamples": [{"user": "你好", "assistant": "你终于来了。"}],
+            },
+        ).json()["data"]
+        created = client.post(
+            "/api/sessions",
+            json={"characterId": character["id"], "worldBookId": None},
+        ).json()["data"]
+
+        client.app.dependency_overrides[get_model_gateway] = FailingReplyGateway
+        failed = client.post(
+            f"/api/sessions/{created['id']}/messages",
+            json={"content": "在吗？"},
+        )
+        assert failed.status_code == 200
+        assert '"type":"error"' in failed.text
+
+        messages = client.get(f"/api/sessions/{created['id']}/messages").json()["data"]
+        assert [message["role"] for message in messages] == ["assistant", "user"]
+        assert messages[0]["unanswered"] is False
+        assert messages[1]["unanswered"] is True
+        dangling_id = messages[1]["id"]
+
+        # 完整轮次里的消息不能走这个接口
+        client.app.dependency_overrides[get_model_gateway] = UnusedGateway
+        client.post(f"/api/sessions/{created['id']}/messages", json={"content": "我们出发吧。"})
+        complete = client.get(f"/api/sessions/{created['id']}/messages").json()["data"]
+        rejected = client.delete(
+            f"/api/sessions/{created['id']}/messages/{complete[-1]['id']}"
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["code"] == "MESSAGE_NOT_DELETABLE"
+
+        missing = client.delete(f"/api/sessions/{created['id']}/messages/not-a-real-message")
+        assert missing.status_code == 404
+        assert missing.json()["code"] == "RESOURCE_NOT_FOUND"
+
+        deleted = client.delete(f"/api/sessions/{created['id']}/messages/{dangling_id}")
+        assert deleted.status_code == 204
+        remaining = client.get(f"/api/sessions/{created['id']}/messages").json()["data"]
+        assert [message["role"] for message in remaining] == ["assistant", "user", "assistant"]
+        assert all(message["unanswered"] is False for message in remaining)
+        assert client.get("/api/sessions").json()["data"][0]["roundCount"] == 1
     finally:
         client.close()
         engine.dispose()

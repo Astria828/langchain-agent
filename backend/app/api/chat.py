@@ -159,6 +159,22 @@ def delete_turn(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.delete(
+    "/sessions/{session_id}/messages/{message_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+def delete_unanswered_message(
+    session_id: str,
+    message_id: str,
+    service: Annotated[ChatService, Depends(get_chat_service)],
+) -> Response:
+    """物理删除一条没能等到回复的断层用户消息。"""
+
+    service.delete_unanswered_message(session_id, message_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.post(
     "/sessions/{session_id}/recommended-reply",
     response_model=DataResponse[RecommendedReplyOutput],

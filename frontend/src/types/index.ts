@@ -25,6 +25,8 @@ export interface Message {
   createdAt: string;
   /** 本轮命中的世界书条目名，仅助手消息可能有 */
   retrieved?: string[];
+  /** 已发出但没能等到回复的断层用户消息，可以被单独删除 */
+  unanswered?: boolean;
 }
 
 export interface RecommendedReply {

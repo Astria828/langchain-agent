@@ -1,8 +1,10 @@
 """按固定应用规则生成结构化角色回复的对话 Chain。"""
 
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 
 from langchain_core.output_parsers import PydanticOutputParser
@@ -12,13 +14,29 @@ from pydantic import ValidationError
 from app.core.config import get_settings
 from app.core.exceptions import AppError
 from app.gateways.model_gateway import ModelGateway
-from app.schemas.dto import ChatReplyBlock, ChatReplyOutput, RecommendedReplyOutput
+from app.schemas.dto import BlockType, ChatReplyBlock, ChatReplyOutput, RecommendedReplyOutput
+
+logger = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "chat.md"
 RECOMMENDED_REPLY_PROMPT_PATH = (
     Path(__file__).resolve().parents[1] / "prompts" / "recommended_reply.md"
 )
 BLOCKS_ARRAY_PATTERN = re.compile(r'"blocks"\s*:\s*\[')
+
+# 兜底解析识别的行首标记。`[动作]/[台词]` 是历史消息回喂给模型时用过的写法，
+# 上游没有执行结构化约束时模型最容易照抄成这一种；其余拼写只是顺带容错。
+BLOCK_MARKER_PATTERN = re.compile(
+    r"^\s*[\[【]\s*(动作|台词|对话|action|dialogue)\s*[\]】]\s*[:：]?\s*(.*)$",
+    re.IGNORECASE,
+)
+MARKER_BLOCK_TYPES: dict[str, BlockType] = {
+    "动作": "action",
+    "action": "action",
+    "台词": "dialogue",
+    "对话": "dialogue",
+    "dialogue": "dialogue",
+}
 
 # 发给上游的 JSON Schema 手写而不是从 ChatReplyOutput 生成：
 # strict 模式要求每层都写死 additionalProperties=false 且不接受 minItems 这类关键字，
@@ -75,6 +93,91 @@ RECOMMENDED_REPLY_DIRECTIVE = (
 )
 
 
+def _blocks_from_json(raw: str) -> list[ChatReplyBlock]:
+    """从整段原文的 blocks 数组里逐个取出内容块对象。
+
+    与流式扫描同一套字符状态机，区别只在这里跳过读不懂的部分而不是整条判废：
+    数组里夹杂的解说文字、尾随逗号、被截断的末尾都不影响已经完整的对象。
+    """
+
+    match = BLOCKS_ARRAY_PATTERN.search(raw)
+    if match is None:
+        return []
+
+    blocks: list[ChatReplyBlock] = []
+    object_chars: list[str] = []
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in raw[match.end() :]:
+        if depth == 0:
+            if char == "]":
+                break
+            if char != "{":
+                continue
+            object_chars = [char]
+            depth = 1
+            in_string = False
+            escaped = False
+            continue
+
+        object_chars.append(char)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                with suppress(json.JSONDecodeError, ValidationError):
+                    block_data = json.loads("".join(object_chars))
+                    blocks.append(ChatReplyBlock.model_validate(block_data))
+                object_chars = []
+    return blocks
+
+
+def _blocks_from_markers(raw: str) -> list[ChatReplyBlock]:
+    """把 `[动作]/[台词]` 逐行文本还原成内容块，未带标记的续行并入上一块。"""
+
+    drafts: list[list[str]] = []
+    for line in raw.splitlines():
+        match = BLOCK_MARKER_PATTERN.match(line)
+        if match is not None:
+            drafts.append([MARKER_BLOCK_TYPES[match.group(1).lower()], match.group(2).strip()])
+            continue
+        text = line.strip()
+        if not text or not drafts:
+            continue
+        drafts[-1][1] = f"{drafts[-1][1]}\n{text}".strip()
+
+    return [
+        ChatReplyBlock(type=block_type, content=content)
+        for block_type, content in drafts
+        if content
+    ]
+
+
+def salvage_reply_blocks(raw: str) -> list[ChatReplyBlock]:
+    """在严格流式解析失败后，尽力从整段原文里还原内容块。
+
+    上游不是每次都会真正执行 json_schema：OpenRouter 这类网关会把同一个模型
+    轮流路由到十几家服务商，其中少数几家收下 response_format、返回 HTTP 200、
+    然后完全无视它。这种静默丢弃既不触发网关的降级重试，也不产生任何告警，
+    模型于是按提示词或历史示范的写法自由输出。这些写法携带的类型与顺序信息
+    与内容块完全等价，能还原就不该把整条回复判废。
+    """
+
+    return _blocks_from_json(raw) or _blocks_from_markers(raw)
+
+
 async def stream_basic_chat_blocks(
     *,
     gateway: ModelGateway,
@@ -90,10 +193,12 @@ async def stream_basic_chat_blocks(
         f"{PROMPT_PATH.read_text(encoding='utf-8').strip()}\n\n{parser.get_format_instructions()}"
     )
     prefix = ""
+    raw_parts: list[str] = []
     object_chars: list[str] = []
     emitted_blocks: list[ChatReplyBlock] = []
     array_started = False
     array_closed = False
+    strict_failed = False
     object_depth = 0
     in_string = False
     escaped = False
@@ -112,6 +217,11 @@ async def stream_basic_chat_blocks(
     ):
         # 推理增量不是回复正文，直接丢弃，避免污染 JSON 结构解析。
         if chunk.kind == "reasoning":
+            continue
+
+        raw_parts.append(chunk.text)
+        # 严格解析已经放弃，但整段原文还要读完，兜底解析要在结束后用它重来一遍。
+        if strict_failed:
             continue
 
         pending = chunk.text
@@ -135,11 +245,8 @@ async def stream_basic_chat_blocks(
                     array_closed = True
                     continue
                 if char != "{":
-                    raise AppError(
-                        status_code=502,
-                        code="MODEL_OUTPUT_INVALID",
-                        message="主模型返回的内容块结构无效",
-                    )
+                    strict_failed = True
+                    break
                 object_chars = [char]
                 object_depth = 1
                 in_string = False
@@ -165,12 +272,9 @@ async def stream_basic_chat_blocks(
                     try:
                         block_data = json.loads("".join(object_chars))
                         block = ChatReplyBlock.model_validate(block_data)
-                    except (json.JSONDecodeError, ValidationError) as exc:
-                        raise AppError(
-                            status_code=502,
-                            code="MODEL_OUTPUT_INVALID",
-                            message="主模型返回的内容块结构无效",
-                        ) from exc
+                    except (json.JSONDecodeError, ValidationError):
+                        strict_failed = True
+                        break
                     emitted_blocks.append(block)
                     yield block
                     object_chars = []
@@ -178,12 +282,47 @@ async def stream_basic_chat_blocks(
     # 逐块解析时已经用 ChatReplyBlock 校验过每个内容块，这里只确认数组本身收尾完整。
     # 不再对整段原文做二次解析：那会让 JSON 前后的寒暄或尾随逗号
     # 把已经正确交付的内容块整条判废。
-    if not array_started or not array_closed or object_depth != 0 or not emitted_blocks:
+    strict_complete = (
+        not strict_failed
+        and array_started
+        and array_closed
+        and object_depth == 0
+        and bool(emitted_blocks)
+    )
+    if strict_complete:
+        return
+
+    # 已经交付出去的内容块撤不回来，再按兜底结果重拼一遍只会和前端已展示的内容重复。
+    # 这种半条回复按失败处理，与“格式异常不保存部分助手回复”的约定一致。
+    if emitted_blocks:
         raise AppError(
             status_code=502,
             code="MODEL_OUTPUT_INVALID",
-            message="主模型返回的内容块结构不完整",
+            message=(
+                "主模型返回的内容块结构无效"
+                if strict_failed
+                else "主模型返回的内容块结构不完整"
+            ),
         )
+
+    salvaged = salvage_reply_blocks("".join(raw_parts))
+    if not salvaged:
+        raise AppError(
+            status_code=502,
+            code="MODEL_OUTPUT_INVALID",
+            message="主模型返回的内容块结构无效",
+        )
+    logger.warning(
+        "主模型未按结构化约束输出，已从原文还原内容块 model=%s blocks=%s",
+        model,
+        len(salvaged),
+        extra={
+            "event": "chat_reply_structure_salvaged",
+            "business_ids": {"model": model, "blockCount": str(len(salvaged))},
+        },
+    )
+    for block in salvaged:
+        yield block
 
 
 def build_recommended_reply_chain(

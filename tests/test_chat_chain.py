@@ -167,3 +167,49 @@ def test_basic_chat_stream_tolerates_wrapping_around_valid_blocks(raw_response: 
     blocks = collect_blocks(StubGateway([raw_response]))
 
     assert [(block.type, block.content) for block in blocks] == [("action", "她抬起头。")]
+
+
+def test_marker_text_reply_is_salvaged_into_blocks() -> None:
+    """上游静默丢弃结构化约束、模型改写成 `[动作]/[台词]` 时仍能还原内容块。"""
+
+    gateway = StubGateway(
+        [
+            "[动作] 她抬起头，指尖停在残卷边缘。\n",
+            "[台词] 明末竹纸，能修。\n",
+            "但要三个月。\n",
+            "[动作] 她把卷轴推回桌心。",
+        ]
+    )
+
+    blocks = collect_blocks(gateway)
+
+    assert [(block.type, block.content) for block in blocks] == [
+        ("action", "她抬起头，指尖停在残卷边缘。"),
+        ("dialogue", "明末竹纸，能修。\n但要三个月。"),
+        ("action", "她把卷轴推回桌心。"),
+    ]
+
+
+def test_salvage_recovers_blocks_when_streaming_scan_hits_garbage() -> None:
+    """blocks 数组起点后立刻出现非法字符时，改用整段原文重新解析。"""
+
+    gateway = StubGateway(
+        ['{"blocks":[ 以下是内容 {"type":"dialogue","content":"你终于来了。"}]}']
+    )
+
+    blocks = collect_blocks(gateway)
+
+    assert [(block.type, block.content) for block in blocks] == [
+        ("dialogue", "你终于来了。")
+    ]
+
+
+def test_unrecoverable_prose_reply_still_fails() -> None:
+    """既不是 JSON 也没有类型标记的纯散文无法还原类型与顺序，仍按失败处理。"""
+
+    gateway = StubGateway(["她笑了笑，说你终于来了。"])
+
+    with pytest.raises(AppError) as excinfo:
+        collect_blocks(gateway)
+
+    assert excinfo.value.code == "MODEL_OUTPUT_INVALID"

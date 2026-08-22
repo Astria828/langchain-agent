@@ -1077,7 +1077,9 @@ class ChatService:
             ).all()
         )
         recent_messages.reverse()
-        messages.extend(self._history_message_to_model(message) for message in recent_messages)
+        messages.extend(
+            self._history_message_to_chat_context(message) for message in recent_messages
+        )
         messages.append({"role": "user", "content": current_input})
         return messages
 
@@ -1164,14 +1166,26 @@ class ChatService:
         lines.extend(("当前输入：", current_input))
         return "\n".join(lines)
 
-    def _history_message_to_model(self, message: MessageModel) -> dict[str, str]:
-        """把历史内容块转换为主模型可读文本，同时保留动作与台词语义。"""
+    def _ordered_blocks(self, message_id: str) -> list[MessageBlockModel]:
+        """按生成顺序读取一条消息的全部内容块。"""
 
-        blocks = self.session.scalars(
-            select(MessageBlockModel)
-            .where(MessageBlockModel.message_id == message.id)
-            .order_by(MessageBlockModel.sequence, MessageBlockModel.id)
-        ).all()
+        return list(
+            self.session.scalars(
+                select(MessageBlockModel)
+                .where(MessageBlockModel.message_id == message_id)
+                .order_by(MessageBlockModel.sequence, MessageBlockModel.id)
+            ).all()
+        )
+
+    def _history_message_to_model(self, message: MessageModel) -> dict[str, str]:
+        """把历史内容块转换为可读文本，同时保留动作与台词语义。
+
+        供检索文本、推荐回复使用：这两条链路要么进 Embedding，要么让模型写用户
+        自己的台词，JSON 包装只会增加噪声。要求模型复现内容块结构的角色回复
+        链路走 `_history_message_to_chat_context`。
+        """
+
+        blocks = self._ordered_blocks(message.id)
         if message.role == "user":
             content = "\n".join(block.content for block in blocks)
         else:
@@ -1180,6 +1194,26 @@ class ChatService:
                 for block in blocks
             )
         return {"role": message.role, "content": content}
+
+    def _history_message_to_chat_context(self, message: MessageModel) -> dict[str, str]:
+        """把历史消息转换为角色回复上下文，助手轮与本次要求的输出结构完全同构。
+
+        上下文里几十条历史是模型能看到的最强格式示范。历史一旦写成
+        `[动作]/[台词]` 这种与 system 要求不同的形状，就等于同时下发两套互相
+        矛盾的格式指令；上游没有真正执行 json_schema 约束时（例如网关把请求
+        路由到静默忽略 response_format 的服务商），模型会照抄历史的写法而不是
+        听指令，整条回复随即被内容块解析判废。助手轮按 ChatReplyOutput 原样
+        回喂，约束缺失时模型的自然倾向也仍然落在正确结构上。
+        """
+
+        blocks = self._ordered_blocks(message.id)
+        if message.role == "user":
+            return {"role": "user", "content": "\n".join(block.content for block in blocks)}
+        payload = {"blocks": [{"type": block.type, "content": block.content} for block in blocks]}
+        return {
+            "role": "assistant",
+            "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        }
 
     def _save_assistant_reply(
         self,

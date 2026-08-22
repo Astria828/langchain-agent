@@ -49,7 +49,7 @@ def test_main_connection_uses_openai_compatible_contract() -> None:
         "payload": {
             "model": "chat-model",
             "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1,
+            "max_tokens": 512,
             "stream": True,
         },
     }
@@ -377,15 +377,31 @@ def test_chat_completion_stream_forwards_reasoning_before_content() -> None:
     ]
 
 
-def test_main_connection_ignores_reasoning_only_response() -> None:
-    """只有推理没有正文时仍判定为主模型输出无效。"""
+def test_main_connection_accepts_reasoning_only_response() -> None:
+    """推理模型可能在测试额度内只输出思维链，这仍然算连接可用。"""
 
     def handler(_request: httpx.Request) -> httpx.Response:
         frames = [
-            'data: {"choices":[{"delta":{"reasoning":"只思考不作答"}}]}\n\n',
+            'data: {"choices":[{"delta":{"reasoning":"先想一下"}}]}\n\n',
             "data: [DONE]\n\n",
         ]
         return httpx.Response(200, text="".join(frames))
+
+    gateway = ModelGateway(transport=httpx.MockTransport(handler))
+    asyncio.run(
+        gateway.test_main(
+            base_url="https://models.example/v1",
+            model="reasoning-model",
+            api_key="sk-test-main",
+        )
+    )
+
+
+def test_main_connection_rejects_empty_response() -> None:
+    """一个增量都没有时仍判定为主模型输出无效。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="data: [DONE]\n\n")
 
     gateway = ModelGateway(transport=httpx.MockTransport(handler))
     with pytest.raises(AppError) as error:

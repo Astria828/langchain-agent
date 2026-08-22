@@ -19,6 +19,8 @@ TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 # 避免为了兼容弱模型反而让原本正常的服务不可用。
 STRUCTURED_OUTPUT_REJECTED_CODES = {400, 404, 415, 422}
 MAX_ATTEMPTS = 2
+# 连接测试的生成额度：推理模型要先输出完思维链才会进入正文，给小了必然被截断。
+CONNECTION_TEST_MAX_TOKENS = 512
 RETRY_DELAY_SECONDS = 0.25
 UPSTREAM_ERROR_MESSAGE_LIMIT = 200
 # 鉴权失败的响应正文最可能把提交的凭据原样回显，这类错误一律不转述上游描述。
@@ -94,17 +96,19 @@ class ModelGateway:
     async def test_main(self, *, base_url: str, model: str, api_key: str) -> None:
         """发送一条最小流式聊天请求并验证主模型支持 SSE。"""
 
-        received_content = False
+        # 推理模型先把额度花在思维链上：token 给少了就只剩推理增量、正文永远等不到，
+        # 所以连接测试既要给够额度，也要把推理增量本身算作"这条 SSE 通了"。
+        received_any = False
         async for chunk in self.stream_chat_completion(
             base_url=base_url,
             model=model,
             api_key=api_key,
             messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
+            max_tokens=CONNECTION_TEST_MAX_TOKENS,
         ):
-            if chunk.kind == "content" and chunk.text:
-                received_content = True
-        if not received_content:
+            if chunk.text:
+                received_any = True
+        if not received_any:
             raise AppError(
                 status_code=502,
                 code="MODEL_OUTPUT_INVALID",
